@@ -25,7 +25,8 @@ function loadConfig() {
     zdr: false,
     cliMode: 'agent', // 信封 mode。服务端枚举（真机 400 报出来的）：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
     cliSessionMode: 'interactive', // lifecycle metadata 的 mode —— 注意这是另一个枚举：interactive | non-interactive
-    fingerprintSalt: '', // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
+    fingerprintSalt: '',
+    deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
   };
 
@@ -48,6 +49,7 @@ function loadConfig() {
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_FINGERPRINT_SALT !== undefined) defaults.fingerprintSalt = process.env.CC_FINGERPRINT_SALT;
+  if (process.env.CC_DEVICE_PROJECT_DIR) defaults.deviceProjectDir = process.env.CC_DEVICE_PROJECT_DIR;
   if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
   if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
@@ -87,9 +89,16 @@ const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
 
 // CLI 的根盐（buildMachineFingerprint 常量 sb）
 const FP_SALT = 'command-code:device-fingerprint:v1';
-const FP_PLATFORM = 'win32';
-const FP_ARCH = 'x64';
-const FP_OS_RELEASE = '10.0.22631';
+// 设备档案：指纹 / config.environment / config.workingDir / x-project-slug / lifecycle.os 共用同一份，
+// 避免出现「指纹说 win32、环境说 linux」这类自相矛盾，也避免把宿主机真实信息（平台、Node 版本、cwd）交给上游。
+const DEVICE_PROFILE = {
+  platform: 'win32',
+  arch: 'x64',
+  osRelease: '10.0.22631',
+  isContainer: false,
+  // 伪造的项目目录：与 x-project-slug 同源（真机里 slug = slugify(workingDir)）
+  projectDir: CFG.deviceProjectDir || 'C:\\Users\\dev\\projects\\app',
+};
 const FP_OS_USERS = ['dev', 'user', 'admin', 'coder', 'engineer', 'work'];
 const FP_MAIL_DOMAINS = ['gmail.com', 'outlook.com', 'qq.com', '163.com'];
 
@@ -161,13 +170,13 @@ function generateFingerprint(apiKey) {
       osUserHash,
       hostnameHash,
       gitEmailHash,
-      platform: FP_PLATFORM,
-      arch: FP_ARCH,
-      osRelease: FP_OS_RELEASE,
+      platform: DEVICE_PROFILE.platform,
+      arch: DEVICE_PROFILE.arch,
+      osRelease: DEVICE_PROFILE.osRelease,
       cpuModel: cpuEntry.model,
       cpuCount: cpuEntry.cores,
       memGiB,
-      isContainer: false,
+      isContainer: DEVICE_PROFILE.isContainer,
       timezone: tz,
       runtime: 'cli',
       collectorVersion: 1,
@@ -476,9 +485,6 @@ function getDateStr() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function getEnvironment() {
-  return `${process.platform}-${process.arch}, Node.js ${process.version.slice(1)}`;
-}
 
 // ── CC 请求体构建 ─────────────────────────────────
 
@@ -602,10 +608,10 @@ function buildCcRequest(openaiReq) {
 
   const body = {
     config: {
-      workingDir: process.cwd(),
+      // 伪造的项目目录（不再发宿主真实 cwd）；environment 用伪装的平台词，与指纹保持自洽
+      workingDir: DEVICE_PROFILE.projectDir,
       date: getDateStr(),
-      // CLI 的 buildServerConfig 发的是平台词（process.platform），不是 "win32-x64, Node.js v24"
-      environment: process.platform,
+      environment: DEVICE_PROFILE.platform,
       structure: [],
       isGitRepo: false,
       currentBranch: '',
@@ -1066,7 +1072,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     'User-Agent': 'cli',
     'x-command-code-version': CC_VERSION,
     'x-cli-environment': 'production',
-    'x-project-slug': slugifyProjectPath(process.cwd()),
+    'x-project-slug': slugifyProjectPath(DEVICE_PROFILE.projectDir),
     'x-taste-learning': 'false',
     'x-session-id': sessionId,
     'Authorization': `Bearer ${apiKey}`,
