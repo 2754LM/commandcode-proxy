@@ -645,14 +645,13 @@ function buildCcRequest(openaiReq) {
   if (reasoning_effort !== undefined) {
     body.params.reasoning_effort = reasoning_effort;
   }
-  if (tools && tools.length > 0) {
-    // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段
-    body.params.tools = tools.map(t => ({
+  // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
+  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段
+  body.params.tools = (tools || []).map(t => ({
       name: toWireToolName(t.function?.name || t.name || ''),
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }));
-  }
   if (tool_choice !== undefined) {
     // OpenAI 格式 → CC (Anthropic 风格) 格式
     if (typeof tool_choice === 'string') {
@@ -894,7 +893,7 @@ function mapCcError(ccStatus, ccBody) {
       const parsed = JSON.parse(ccBody);
       message = parsed.error?.message || parsed.message || message;
       // 上游错误体：{"success":false,"error":{"code":"BAD_REQUEST"|"USAGE_EXCEEDED",...}}
-      // code 是账号池判定「额度耗尽 / 凭据被拒」的依据，必须透出来（多账号计划 §4）
+      // code 是上游的机器可读错误分类（BAD_REQUEST / USAGE_EXCEEDED 等），透出来便于下游 SDK 与运维判定
       code = parsed.error?.code || parsed.code || null;
     } catch {
       message = ccBody.slice(0, 200) || message;
