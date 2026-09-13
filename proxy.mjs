@@ -23,7 +23,8 @@ function loadConfig() {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
-    cliMode: 'interactive', // 信封 mode / lifecycle metadata 用；CLI 取值 interactive | non-interactive
+    cliMode: 'agent', // 信封 mode。服务端枚举（真机 400 报出来的）：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
+    cliSessionMode: 'interactive', // lifecycle metadata 的 mode —— 注意这是另一个枚举：interactive | non-interactive
     fingerprintSalt: '', // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
   };
@@ -48,6 +49,7 @@ function loadConfig() {
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_FINGERPRINT_SALT !== undefined) defaults.fingerprintSalt = process.env.CC_FINGERPRINT_SALT;
   if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
+  if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
 
   return defaults;
@@ -387,7 +389,7 @@ async function ensureInitialized(apiKey, signal) {
           metadata: {
             sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
             cliVersion: CC_VERSION,
-            mode: CFG.cliMode || 'interactive',
+            mode: CFG.cliSessionMode || 'interactive',
             os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
           },
         }),
@@ -484,10 +486,10 @@ function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
   // 提取系统提示：OpenAI 的 system / developer 都映射为系统提示。
-  // 形态对齐 CLI 的 toWireSystem —— params.system 是「块数组」，不是字符串。
-  // 旧注释里「数组会被上游拒绝」的结论来自更早的协议版本，已被 command-code@1.53.1
-  // 源码推翻（见 PROTOCOL-FACTS-1.53.1.md §5）。
-  // CLI 的 toWireSystem：system 以「块数组」下发，非最后一块补 '\n'，cache_control 逐块保留
+  // 形态对齐 CLI 的 toWireSystem —— **块数组**，非最后一块补 \n，cache_control 逐块保留。
+  // （CLI 的 composeSystemPrompt：基础提示词是字符串时发字符串、是 sections 时发块数组；
+  //   真机验证两种形态服务端都接受，见 PROTOCOL-FACTS-1.53.1.md。这里统一用块数组，
+  //   才能把客户端标在 system 上的缓存断点原样送上去。）
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
   const systemBlocks = [];
   for (const m of systemMsgs) {
@@ -589,8 +591,9 @@ function buildCcRequest(openaiReq) {
     return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
   });
 
-  // 缓存断点：CLI 用 systemSections[].cache 表达。保留客户端带来的断点；若客户端只给了
-  // OpenAI 系的 prompt_cache_key，就把断点落在 system 最后一块（块数组是 CLI 的原生形态）
+  // 缓存断点：system 是块数组，断点可以原样留在 system 上（CLI 的 systemSections[].cache 同义）。
+  // 客户端已在任意消息块 / system 块上打过断点就保留；否则若给了 OpenAI 系的 prompt_cache_key，
+  // 把断点落在 system 最后一块 —— 缓存按前缀计算，system 正是最前的那段前缀。
   const hasCacheMarker = systemBlocks.some(b => b.cache_control) || ccMessages.some(msg =>
     Array.isArray(msg.content) && msg.content.some(part => part?.cache_control));
   if (prompt_cache_key && !hasCacheMarker && systemBlocks.length) {
@@ -614,7 +617,7 @@ function buildCcRequest(openaiReq) {
     taste: null,
     skills: null,          // CLI 发 null，不是空串
     permissionMode: 'standard',
-    mode: CFG.cliMode || 'interactive',
+    mode: CFG.cliMode || 'agent',
     // threadId 需为合法 UUID，否则整键省略（CLI 的 toWireThreadId）—— 在 forwardToCC 拿到 sessionId 后补
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
@@ -1614,10 +1617,11 @@ function convertAnthropicToOpenAI(anthropicReq) {
         if (toolNameFromId[tr.tool_use_id]) toolMsg.name = toolNameFromId[tr.tool_use_id];
         openaiMessages.push(toolMsg);
       }
-      if (parts.length) {
-        // 单块纯文本仍用字符串（线格不变）；多块 / 带断点 / 含图片时用块数组（CLI 的形态）
-        const onlyText = parts.length === 1 && parts[0].type === 'text' && !textHasCache;
-        openaiMessages.push({ role: 'user', content: onlyText ? textContent : parts });
+      if (parts.length || textContent) {
+        // 单块纯文本仍用字符串（线格不变）；多块 / 带断点 / 含图片时用块数组（CLI 的形态）。
+        // 注意：content 为字符串时 parts 为空，必须用 textContent 判空（否则整条消息会丢）
+        const singleText = parts.length <= 1 && (parts.length === 0 || parts[0].type === 'text') && !textHasCache;
+        openaiMessages.push({ role: 'user', content: singleText ? textContent : parts });
       }
     }
   }
