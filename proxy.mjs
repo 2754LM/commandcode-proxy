@@ -23,6 +23,7 @@ function loadConfig() {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
+    cliMode: 'interactive', // 信封 mode / lifecycle metadata 用；CLI 取值 interactive | non-interactive
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
   };
 
@@ -44,6 +45,7 @@ function loadConfig() {
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
+  if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
 
   return defaults;
@@ -326,7 +328,7 @@ async function ensureInitialized(apiKey, signal) {
           metadata: {
             sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
             cliVersion: CC_VERSION,
-            mode: 'interactive',
+            mode: CFG.cliMode || 'interactive',
             os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
           },
         }),
@@ -538,13 +540,12 @@ function buildCcRequest(openaiReq) {
     if (cacheBoundary) cacheBoundary.cache_control = { type: 'ephemeral' };
   }
 
-  const threadId = newThreadId();
-
   const body = {
     config: {
       workingDir: process.cwd(),
       date: getDateStr(),
-      environment: getEnvironment(),
+      // CLI 的 buildServerConfig 发的是平台词（process.platform），不是 "win32-x64, Node.js v24"
+      environment: process.platform,
       structure: [],
       isGitRepo: false,
       currentBranch: '',
@@ -554,8 +555,10 @@ function buildCcRequest(openaiReq) {
     },
     memory: null,
     taste: null,
-    skills: '',
+    skills: null,          // CLI 发 null，不是空串
     permissionMode: 'standard',
+    mode: CFG.cliMode || 'interactive',
+    // threadId 需为合法 UUID，否则整键省略（CLI 的 toWireThreadId）—— 在 forwardToCC 拿到 sessionId 后补
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
@@ -963,16 +966,26 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  // CLI 的 toWireThreadId：只有合法 UUID 才放进信封，否则整个键省略。
+  // 同时按 CLI 的键顺序重排：config, memory, taste, skills, permissionMode, threadId, mode, params
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sessionId))) {
+    const ordered = {};
+    for (const k of ['config', 'memory', 'taste', 'skills', 'permissionMode']) ordered[k] = body[k];
+    ordered.threadId = sessionId;
+    for (const k of ['mode', 'promptCache', 'params']) if (k in body) ordered[k] = body[k];
+    body = ordered;
+  }
 
+  // 与 CLI 的 buildCommandAuthHeaders 对齐：没有 x-co-flag；User-Agent 固定 "cli"
   const headers = {
     'Content-Type': 'application/json',
-    'Authorization': `Bearer ${apiKey}`,
-    'x-cli-environment': 'production',
+    'User-Agent': 'cli',
     'x-command-code-version': CC_VERSION,
-    'x-session-id': sessionId,
-    'x-co-flag': 'false',
-    'x-taste-learning': 'false',
+    'x-cli-environment': 'production',
     'x-project-slug': fakeProjectSlug(sessionId),
+    'x-taste-learning': 'false',
+    'x-session-id': sessionId,
+    'Authorization': `Bearer ${apiKey}`,
     'traceparent': traceparent,
   };
 
