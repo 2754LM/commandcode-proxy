@@ -887,11 +887,15 @@ const CC_STATUS_MAP = {
 function mapCcError(ccStatus, ccBody) {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
   let message = `CC API error (${ccStatus})`;
+  let code = null;
 
   if (ccBody) {
     try {
       const parsed = JSON.parse(ccBody);
       message = parsed.error?.message || parsed.message || message;
+      // 上游错误体：{"success":false,"error":{"code":"BAD_REQUEST"|"USAGE_EXCEEDED",...}}
+      // code 是账号池判定「额度耗尽 / 凭据被拒」的依据，必须透出来（多账号计划 §4）
+      code = parsed.error?.code || parsed.code || null;
     } catch {
       message = ccBody.slice(0, 200) || message;
     }
@@ -901,18 +905,20 @@ function mapCcError(ccStatus, ccBody) {
   if (ccStatus === 429) {
     return {
       status: 429,
+      code,
       body: {
-        error: { message, type: 'rate_limit_error' },
+        error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) },
         retry_after: 30,
       },
     };
   }
 
-  return { status: mapped.status, body: { error: { message, type: mapped.type } } };
+  return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
 function mapCcEventError(event) {
   const message = event.error?.message || event.message || 'Unknown CC error';
+  const code = event.error?.code || event.code || null;
   const statusMatch = message.match(/^<(\d{3})>/);
   const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
@@ -922,11 +928,12 @@ function mapCcEventError(event) {
   if (mapped.status === 429) {
     return {
       status: 429,
-      body: { error: { message, type: 'rate_limit_error' }, retry_after: 30 },
+      code,
+      body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 30 },
     };
   }
 
-  return { status: mapped.status, body: { error: { message, type: mapped.type } } };
+  return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
 // ── HTTP 请求处理 ──────────────────────────────────
@@ -1127,8 +1134,8 @@ async function handleChatCompletions(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
+      log('error', 'CC API error', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
@@ -1963,8 +1970,8 @@ async function handleMessages(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
+      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
@@ -2760,8 +2767,8 @@ async function handleResponses(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
+      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
     }
