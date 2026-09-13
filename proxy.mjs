@@ -1829,7 +1829,10 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
           case 'finish-step':
           case 'finish': {
-            if (event.finishReason) stopReason = mapAnthropicStopReason(event.finishReason);
+            // 上游的 finishReason 是 'tool-calls'（连字符），必须先过 mapFinishReason 规范化成
+            // 'tool_calls'，否则会掉进 mapAnthropicStopReason 的 default 变成 end_turn。
+            // 真机实测踩到过：工具调用成功但 stop_reason 报 end_turn。
+            if (event.finishReason) stopReason = mapAnthropicStopReason(mapFinishReason(event.finishReason));
             const u = event.totalUsage || event.usage;
             if (u) {
               normalizeUsage(u);
