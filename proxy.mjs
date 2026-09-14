@@ -1050,6 +1050,34 @@ function getApiKey(headers) {
   return null;
 }
 
+// ── 热插拔接缝：可选插件只通过这两个钩子接入 ─────────────────────
+// 核心**不认识**任何插件侧概念（凭证存储、冷却、封禁、重试策略全在插件里）；
+// 插件挂上去之前，下面两个包装函数逐字节退化成原来的行为
+// （resolveKey → getApiKey，forwardVia → 直接转发）。
+//
+//   hooks.resolveKey(req, fallbackKey) -> key | undefined
+//       决定这次请求用哪个上游 key。返回 undefined = 不接管，用客户端自带的 key。
+//       ⚠️ 返回的 key 就是下游 sessionStore / keyStateStore 的键，
+//          所以插件返回「上游账号 key」即自动获得 per-账号 的会话与指纹隔离。
+//   hooks.forward(ctx, key, doForward) -> Response
+//       自己决定怎么发、失败怎么办（分类/冷却/换号重试）。
+//       ctx = { kind: 'chat'|'messages'|'responses'|'models', req }
+//       调用时**尚未向客户端写过任何字节**，所以重试是安全的；
+//       插件要保证最终返回一个「像上游响应」的 Response（非 2xx 会走既有的错误映射）。
+export const hooks = { resolveKey: null, forward: null };
+
+async function resolveKey(req) {
+  const fallback = getApiKey(req.headers);
+  if (!hooks.resolveKey) return fallback;
+  const r = await hooks.resolveKey(req, fallback);
+  return r === undefined ? fallback : r;
+}
+
+async function forwardVia(ctx, key, fn) {
+  if (!hooks.forward) return fn(key);
+  return hooks.forward(ctx, key, fn);
+}
+
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
@@ -1108,7 +1136,7 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
+  const apiKey = await resolveKey(req);
   if (!apiKey) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
@@ -1132,10 +1160,12 @@ async function handleChatCompletions(req, res) {
   let translator = null;
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    // 预请求跟着 key 走：换号重试时，新账号也会先补上 fingerprint/lifecycle 再发 generation
+    const ccResponse = await forwardVia({ kind: 'chat', req }, apiKey, async (k) => {
+      await ensureInitialized(k, abortController.signal);
+      return forwardToCC(ccBody, k, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    });
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -1947,7 +1977,7 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
+  const apiKey = await resolveKey(req);
   if (!apiKey) {
     sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
@@ -1969,9 +1999,10 @@ async function handleMessages(req, res) {
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    const ccResponse = await forwardVia({ kind: 'messages', req }, apiKey, async (k) => {
+      await ensureInitialized(k, abortController.signal);   // 预请求跟着 key 走（见 chat 路径注释）
+      return forwardToCC(ccBody, k, req.headers, abortController.signal);
+    });
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -2718,7 +2749,7 @@ async function handleResponses(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
+  const apiKey = await resolveKey(req);
   if (!apiKey) {
     sendResponsesError(res, 401, 'authentication_error',
       'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
@@ -2767,8 +2798,10 @@ async function handleResponses(req, res) {
   });
 
   try {
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    const ccResponse = await forwardVia({ kind: 'responses', req }, apiKey, async (k) => {
+      await ensureInitialized(k, abortController.signal);   // 预请求跟着 key 走（见 chat 路径注释）
+      return forwardToCC(ccBody, k, req.headers, abortController.signal, promptCacheKey);
+    });
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -2976,8 +3009,8 @@ async function handleResponses(req, res) {
 }
 
 async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
-  const models = await fetchModels(apiKey);
+  const apiKey = await resolveKey(req);
+  const models = await forwardVia({ kind: 'models', req }, apiKey, (k) => fetchModels(k));
   const now = nowUnix();
   sendJSON(res, 200, {
     object: 'list',
@@ -3066,7 +3099,13 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-server.listen(CFG.port, CFG.host, () => {
+// 形态 A（单文件）：`node proxy.mjs` 自己启动监听，行为与之前完全一致。
+// 形态 B（带 UI）：`node console/server.mjs` 会 import 本模块并自行 listen，
+// 此时必须跳过这里的 listen —— 否则 import 后 ~45ms 就会占住端口（HANDOFF-webui.md §5 坑 2）。
+const isDirectRun = !!process.argv[1] &&
+  resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1]);
+
+if (isDirectRun) server.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
@@ -3096,3 +3135,21 @@ server.listen(CFG.port, CFG.host, () => {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
 });
+
+// ── 形态 B 的接缝：导出模块级单例 ────────────────────
+// 注意这是**单例导出**，不是工厂：`const CFG`(L60) 与 `const server`(L3000) 都在模块作用域，
+// 任何 `createProxyServer(opts)` 式的参数（除 hook 外）都会被静默忽略（HANDOFF-webui.md D3 / §5 坑 1）。
+// console/ 只 import 这些单例，不复制任何协议或伪装逻辑（D4）。
+export {
+  server,              // http.Server 单例
+  CFG,                 // 生效配置（config.json + 环境变量覆写后的最终值）
+  log,                 // 与核心同格式的日志函数
+  keyStateStore,       // apiKey → { fingerprint, nextInitAt }：设备伪装面板的数据源
+  sessionStore,        // apiKey → { sessionId, expiresAt }：会话数
+  MODELS,              // 内置模型列表
+  DEVICE_PROFILE,      // 伪装设备档案
+  CC_VERSION,          // 当前 x-command-code-version（let → live binding）
+  CC_PROTOCOL_VERSION, // 协议版本常量（与已实现方言绑定，不跟随 npm）
+  MAX_INFLIGHT,        // 在途上限
+  inflightCount,       // 当前在途数（let → live binding）
+};
