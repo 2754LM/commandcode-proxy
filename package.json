@@ -7,6 +7,8 @@
   "main": "proxy.mjs",
   "scripts": {
     "start": "node proxy.mjs",
+    "console": "node console/server.mjs",
+    "accounts": "node console/accounts.mjs",
     "dev": "node --watch proxy.mjs",
     "docker:build": "docker build -t commandcode-proxy:latest .",
     "docker:build:multi": "docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy:latest ."

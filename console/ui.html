@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command Code Proxy · 控制台</title>
+<!--
+  极简运维控制台（只读）。手写单文件设计系统，零运行时依赖、零构建（HANDOFF-webui.md D2/R4）。
+
+  设计读向：单人自用的本地只读控制台，冷静极简，单色为主 + 只有语义状态色。
+  刻度：DESIGN_VARIANCE 5 / MOTION_INTENSITY 3 / VISUAL_DENSITY 3。
+
+  刻意遵守的约束（design-taste-frontend）：
+    - 零 em-dash（空值占位一律用 ASCII 连字符 "-"）
+    - 中点不是通用分隔符：元信息之间用留白与栏位分隔
+    - 无装饰性状态点；无带填充轨道的进度条；无卡片、无阴影、无渐变
+    - 页面主题锁：整页一个主题（跟随系统，暗色为同一套 token），没有任何区块反色
+    - 形状锁：全站圆角 0，唯一的例外在下面 :root 的注释里说明
+    - H1 不用超大字号，层级靠字重与颜色
+    - 交互状态齐全：骨架屏 / 空状态 / 错误横幅 / :active 位移 / :focus-visible
+  data-theme="dark" 是给验证与手动覆盖留的钩子（见下方暗色 token 块）。
+-->
+<style>
+/* ── Token：中性色用一套 zinc 家族，不混冷暖 ───────────────── */
+:root{
+  --canvas:#fafafa;
+  --ink:#18181b;          /* 正文与主要数据 */
+  --ink-2:#3f3f46;        /* 次要数据 */
+  --muted:#71717a;        /* 标签、单位、说明 */
+  --faint:#a1a1aa;        /* 骨架屏、禁用 */
+  --line:#e4e4e7;         /* 唯一的分隔线颜色 */
+  --hover:#00000008;      /* 行悬浮底色，不用纯黑阴影 */
+  --ok:#15803d;
+  --warn:#a16207;
+  --err:#b91c1c;
+  --font:system-ui,-apple-system,"Segoe UI Variable Text","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  /* 形状锁：全站圆角 0。表格、按钮、输入、代码块一律直角，
+     唯一例外是 focus-visible 的外描边（描边不参与形状系统）。 */
+  --radius:0;
+}
+/* 暗色 token（同一套语义，仅换值）。媒体查询与 data-theme 两条路径共用同一组值。 */
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --canvas:#101012; --ink:#f4f4f5; --ink-2:#d4d4d8; --muted:#8b8b93; --faint:#52525b;
+    --line:#27272a; --hover:#ffffff0a; --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
+  }
+}
+:root[data-theme="dark"]{
+  --canvas:#101012; --ink:#f4f4f5; --ink-2:#d4d4d8; --muted:#8b8b93; --faint:#52525b;
+  --line:#27272a; --hover:#ffffff0a; --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
+}
+
+*{box-sizing:border-box}
+[hidden]{display:none !important}
+html,body{margin:0;padding:0}
+body{
+  background:var(--canvas); color:var(--ink); font-family:var(--font);
+  font-size:16px; line-height:1.55; -webkit-font-smoothing:antialiased;
+}
+h1,h2,h3,p{margin:0}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;border-radius:var(--radius)}
+button:active{transform:translateY(1px)}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.num,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.muted{color:var(--muted)}
+
+/* ── 左侧导轨：不填底色（填色即区块反色，违反主题锁）。
+   导轨高度 = 内容高度，不拉满视口：否则控件会被顶到底、中间挂出几百像素空列。
+   分隔线挂到内容列的 border-left 上，这样它是一条贯通整页的结构线，而不是一节短线。
+   注意：**不要给 shell 加 max-width 居中**，那样导轨会被推进屏幕内侧（2560 屏上偏 400+px），
+   一个「左边」的导航栏却不在左边，看着就是坏的。宽度问题交给内容列自己处理。 */
+.shell{
+  display:grid;grid-template-columns:240px minmax(0,1fr);min-height:100dvh;
+}
+.rail{
+  position:sticky;top:0;align-self:start;
+  display:flex;flex-direction:column;padding:28px 22px 24px;
+}
+.brand{font-size:16px;font-weight:600;letter-spacing:-.1px;white-space:nowrap}
+.brand small{display:block;font-size:13px;font-weight:400;color:var(--muted);margin-top:2px;white-space:normal}
+.nav{display:flex;flex-direction:column;gap:1px;margin-top:30px}
+.nav a{
+  display:flex;align-items:baseline;gap:10px;padding:5px 0 5px 11px;font-size:16px;color:var(--muted);
+  text-decoration:none;border-left:1px solid transparent;
+}
+.nav a:hover{color:var(--ink)}
+.nav a[aria-current]{color:var(--ink);border-left-color:var(--ink)}
+/* 计数与禁用态用 --muted 而不是 --faint：--faint 在暗色下只有 2.46:1，
+   禁用控件虽然 WCAG 豁免，但既然能读就让它读得清（禁用靠边框与无 hover 表达） */
+.nav-count{margin-left:auto;font-family:var(--mono);font-size:13px;color:var(--muted)}
+.rail-foot{margin-top:26px;padding-top:18px;border-top:1px solid var(--line)}
+.rail-foot .chip{display:block;font-size:13px;color:var(--muted);margin-bottom:8px}
+.rail-foot .row{display:flex;gap:8px}
+.rail-foot .row .btn{flex:1;padding-left:0;padding-right:0}
+.btn{
+  border:1px solid var(--line);padding:5px 11px;font-size:14px;line-height:1.4;
+  color:var(--ink);background:transparent;white-space:nowrap;
+}
+.btn:hover{border-color:var(--ink);background:var(--hover)}
+.btn.primary{background:var(--ink);color:var(--canvas);border-color:var(--ink)}
+.btn.primary:hover{opacity:.86}
+
+/* ── 内容列：中段封顶并居中，导轨始终贴左。
+   三种做法只有这条没有坏相：
+     shell 居中封顶 -> 导轨被推进屏幕内侧，一个「左边」的导航栏不在左边（坏）
+     内容左对齐封顶 -> 右侧堆一大片空（坏）
+     完全流式       -> 超宽下表格列被拉稀，设备表两列能隔开 600px（坏）
+   分隔线挂在 .col 上：它是贯通整页的结构线，且永远贴着导轨那一侧。 */
+.col{border-left:1px solid var(--line);min-width:0}
+main{max-width:1440px;margin:0 auto;padding:52px 44px 56px}
+.head{padding:0}
+h1{font-size:26px;font-weight:600;letter-spacing:-.2px}
+.meta{display:flex;flex-wrap:wrap;gap:6px 28px;margin-top:10px;font-size:14px;color:var(--muted)}
+.meta b{font-weight:400;color:var(--ink-2);font-family:var(--mono)}
+
+.banner{
+  margin-top:24px;padding:10px 0 10px 14px;border-left:2px solid var(--err);
+  font-size:14px;color:var(--err);word-break:break-word;
+}
+
+section.view{margin-top:36px}
+h3{font-size:14px;font-weight:500;color:var(--muted);margin-bottom:4px}
+
+/* ── 指标：标签在上，数值在下，纯留白分栏（无竖线、无卡框） ── */
+/* 指标：固定 6 / 3 / 2 栏。用 auto-fit 会在中等宽度掉成 5+1，末尾孤一项很难看 */
+.metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:30px 34px;margin-top:22px}
+.metrics .k{font-size:13px;color:var(--muted);white-space:nowrap}
+.metrics .v{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:32px;font-weight:500;
+  letter-spacing:-.6px;line-height:1.25;margin-top:2px;white-space:nowrap}
+.metrics .v span{font-size:14px;font-weight:400;color:var(--muted);letter-spacing:0}
+.metrics .s{font-size:13px;color:var(--muted);font-family:var(--mono);margin-top:2px;white-space:nowrap}
+.ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
+
+/* ── 表格：只保留行底一条线（不用上+下双线） ──────────────── */
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th{
+  text-align:left;font-size:13px;font-weight:500;color:var(--muted);
+  padding:0 12px 6px 0;border-bottom:1px solid var(--line);white-space:nowrap;
+}
+td{padding:7px 12px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
+th:last-child,td:last-child{padding-right:0}
+td.r,th.r{text-align:right}
+tbody tr:hover{background:var(--hover)}
+tbody tr.toggle{cursor:pointer}
+tbody tr.detail td{border-bottom:1px solid var(--line);background:transparent}
+.cell-sub{display:block;font-size:13px;color:var(--muted);font-family:var(--mono)}
+.clip{display:inline-block;max-width:min(64ch,100%);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+
+/* 行内展开开关：真 button，键盘可用，不用图标字体或手绘 SVG */
+.expander{font-family:var(--mono);color:var(--muted);padding:0 6px 0 0}
+.expander:hover{color:var(--ink)}
+.components{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px 28px;padding:14px 0 18px}
+.components .k{font-size:13px;color:var(--muted);font-family:var(--mono)}
+.components .v{font-size:14px;font-family:var(--mono);color:var(--ink-2);word-break:break-word;margin-top:1px;white-space:pre-line}
+
+/* ── 状态码 / 模型 / 配置 ─────────────────────────────────── */
+.split{display:grid;grid-template-columns:minmax(0,330px) minmax(0,1fr);gap:56px;margin-top:24px}
+/* 模型：id 永远是主数据，不许被截断；让位的是右边的显示名。
+   列宽 340px 起步：这样 1014px 内容下走 2 栏、1352px 下走 3 栏，两种情况显示名都不会被截 */
+.models{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:6px 28px;margin-top:12px}
+.model{display:flex;justify-content:space-between;gap:14px;padding:3px 0;border-bottom:1px solid var(--line);min-width:0;overflow:hidden}
+.model .id{font-family:var(--mono);font-size:14px;color:var(--ink-2);white-space:nowrap;flex:0 0 auto}
+.model .nm{font-size:13px;color:var(--muted);white-space:nowrap;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+/* 配置：key/value 成对网格。值都很短，用两列表格会把值列拉出几百像素空列 */
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:0 40px;margin-top:8px}
+.kv .pair{display:flex;align-items:baseline;justify-content:space-between;gap:18px;padding:7px 0;border-bottom:1px solid var(--line);min-width:0}
+.kv .pk{color:var(--muted);font-size:14px;white-space:nowrap}
+.kv .pv{font-family:var(--mono);font-size:14px;color:var(--ink-2);text-align:right;overflow-wrap:anywhere;min-width:0}
+
+/* ── 骨架屏：形状与最终布局一致，静态不闪（MOTION 3） ─────── */
+.sk{display:block;height:12px;background:var(--line);border-radius:var(--radius)}
+.sk.w40{width:40%} .sk.w60{width:60%} .sk.w80{width:80%}
+
+.empty{padding:14px 0;color:var(--muted);font-size:14px}
+footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}
+
+/* ── 分页器（上游错误视图用；视图本身由 [hidden] 切换） ─────── */
+.pager{display:flex;align-items:center;gap:12px;margin-top:18px}
+.pager .btn{padding:4px 12px}
+.pager .btn:disabled{color:var(--muted);border-color:var(--line);cursor:default}
+.pager .btn:disabled:hover{border-color:var(--line);background:transparent}
+.pager .pos{font-family:var(--mono);font-size:13px;color:var(--muted);margin-left:auto}
+
+/* ── 账号视图的小控件（保持直线+发丝线，不加卡片） ─────────── */
+.login{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0}
+.form-in{
+  font:inherit;font-size:14px;color:var(--ink);background:transparent;
+  border:1px solid var(--line);border-radius:var(--radius);padding:6px 10px;min-width:0;
+}
+.form-in:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+.form-in::placeholder{color:var(--faint)}
+.in-key{width:300px} .in-sm{width:130px} .in-num{width:64px}
+/* 摘要指标不该跟着大屏栅格摊开：封顶 + 小一号字 */
+#pool-metrics{grid-template-columns:repeat(6,minmax(0,1fr));max-width:840px;gap:20px 28px}
+#pool-metrics .v{font-size:24px}
+.row-inline{display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-top:8px}
+.inline{display:flex;align-items:center;gap:6px;font-size:14px;color:var(--ink-2)}
+.act{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}
+.act button{font-size:13px;padding:3px 9px}
+.quota-bar{display:flex;gap:10px;font-family:var(--mono);font-size:12px;color:var(--muted)}
+.quota-bar b{color:var(--ink-2);font-weight:400}
+.bad-state{color:var(--err)} .warn-state{color:var(--warn)} .ok-state{color:var(--ok)}
+/* 账号表：第一列 shrink-to-fit，别让状态列的长文本把 hint 挤成两行 */
+#acct-rows td:first-child{width:1%;white-space:nowrap}
+#acct-rows .act{flex-wrap:nowrap}
+
+@media (max-width:1400px){
+  .metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:24px 28px}
+}
+@media (max-width:900px){
+  /* 导轨塌成顶部横条：导航在窄屏也不藏起来 */
+  .shell{grid-template-columns:1fr}
+  .rail{
+    position:static;padding:18px;border-bottom:1px solid var(--line);
+  }
+  .nav{flex-direction:row;flex-wrap:wrap;gap:2px 18px;margin-top:14px}
+  .nav a{padding:2px 0;border-left:0}
+  .nav a[aria-current]{box-shadow:inset 0 -1px 0 var(--ink)}
+  .rail-foot{margin-top:16px;padding-top:14px}
+  .col{border-left:0}
+  main{padding:32px 20px 72px;max-width:none}
+}
+@media (max-width:680px){
+  .split{grid-template-columns:1fr;gap:26px}
+  .metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:22px 20px}
+  .clip{max-width:24ch}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none !important;animation:none !important}}
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <aside class="rail">
+    <div class="brand">Command Code Proxy<small>只读 / 仅本机</small></div>
+    <nav class="nav" aria-label="视图">
+      <a href="#/status" data-view="status">运行状态</a>
+      <a href="#/device" data-view="device">设备伪装<span class="nav-count" id="nav-device">-</span></a>
+      <a href="#/errors" data-view="errors">上游错误<span class="nav-count" id="nav-errors">-</span></a>
+      <a href="#/models" data-view="models">模型<span class="nav-count" id="nav-models">-</span></a>
+      <a href="#/accounts" data-view="accounts">账号<span class="nav-count" id="nav-accounts">-</span></a>
+      <a href="#/config" data-view="config">配置</a>
+    </nav>
+    <div class="rail-foot">
+      <span class="chip" id="chip-poll">自动刷新 2s</span>
+      <div class="row">
+        <button class="btn" id="btn-poll" type="button">暂停</button>
+        <button class="btn primary" id="btn-now" type="button">刷新</button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="col">
+  <main>
+    <div class="banner" id="banner" hidden role="status"></div>
+
+    <div class="head">
+      <h1 id="view-title">运行状态</h1>
+      <p class="meta" id="meta"><span><b>-</b></span></p>
+    </div>
+
+    <section class="view" id="v-status">
+      <div class="metrics" id="metrics">
+        <div><div class="k">当前在途</div><div class="v"><span class="sk w60"></span></div><div class="s">-</div></div>
+        <div><div class="k">请求总数</div><div class="v"><span class="sk w60"></span></div><div class="s">-</div></div>
+        <div><div class="k">成功率</div><div class="v"><span class="sk w60"></span></div><div class="s">-</div></div>
+        <div><div class="k">延迟 p50</div><div class="v"><span class="sk w60"></span></div><div class="s">-</div></div>
+        <div><div class="k">延迟 p95</div><div class="v"><span class="sk w60"></span></div><div class="s">-</div></div>
+        <div><div class="k">运行时长</div><div class="v"><span class="sk w60"></span></div><div class="s">-</div></div>
+      </div>
+      <div class="split">
+        <div>
+          <h3>状态码</h3>
+          <table>
+            <thead><tr><th>码</th><th class="r">次数</th><th class="r">占比</th></tr></thead>
+            <tbody id="status-rows"><tr><td colspan="3"><span class="sk w80"></span></td></tr></tbody>
+          </table>
+        </div>
+        <div>
+          <h3>端点</h3>
+          <table>
+            <thead><tr><th>路径</th><th class="r">总数</th><th class="r">失败</th><th class="r">均耗时</th><th class="r">峰值</th></tr></thead>
+            <tbody id="path-rows"><tr><td colspan="5"><span class="sk w80"></span></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="v-device" hidden>
+      <table>
+        <thead><tr><th>API Key</th><th>设备指纹</th><th>下次上报</th><th>会话</th></tr></thead>
+        <tbody id="device-rows"><tr><td colspan="4"><span class="sk w60"></span></td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="view" id="v-errors" hidden>
+      <table>
+        <thead><tr><th>时间</th><th>路径</th><th>状态</th><th>code</th><th>type</th><th>摘要</th></tr></thead>
+        <tbody id="error-rows"><tr><td colspan="6"><span class="sk w80"></span></td></tr></tbody>
+      </table>
+      <div class="pager">
+        <button class="btn" id="btn-prev" type="button" disabled>上一页</button>
+        <button class="btn" id="btn-next" type="button" disabled>下一页</button>
+        <span class="pos" id="page-pos">-</span>
+      </div>
+    </section>
+
+    <section class="view" id="v-models" hidden>
+      <div class="models" id="model-list"><span class="sk w60"></span></div>
+    </section>
+
+    <section class="view" id="v-accounts" hidden>
+      <div id="pool-off" class="empty" hidden></div>
+
+      <div id="pool-login" hidden>
+        <h3>需要管理口令</h3>
+        <p class="muted" style="margin:6px 0 14px">口令是启动 console 时的环境变量 <span class="mono">CC_ADMIN_PASSWORD</span>。写口（增删账号、解封、改准入）都要它。</p>
+        <form id="login-form" class="login">
+          <input type="password" id="pw" class="form-in in-key" autocomplete="current-password" placeholder="管理口令" aria-label="管理口令">
+          <button class="btn primary" type="submit">登录</button>
+        </form>
+        <p class="muted" id="login-msg" style="margin-top:10px"></p>
+      </div>
+
+      <div id="pool-panel" hidden>
+        <div class="metrics" id="pool-metrics"></div>
+
+        <h3 style="margin-top:26px">准入</h3>
+        <div class="row-inline">
+          <label class="inline"><input type="radio" name="accmode" value="open"> 开放（任何带 key 的客户端）</label>
+          <label class="inline"><input type="radio" name="accmode" value="whitelist"> 白名单</label>
+          <input type="text" id="new-client" placeholder="客户端 key（user_…）" aria-label="客户端 key">
+          <button class="btn" id="btn-add-client" type="button">加入白名单</button>
+        </div>
+        <table style="margin-top:8px">
+          <thead><tr><th>客户端 key</th><th>备注</th><th class="r">操作</th></tr></thead>
+          <tbody id="client-rows"></tbody>
+        </table>
+
+        <h3 style="margin-top:26px">添加账号</h3>
+        <form id="add-form" class="login" style="margin-top:8px">
+          <input type="text" id="new-key" class="form-in in-key" placeholder="上游 API key（user_…）" aria-label="上游 API key">
+          <input type="text" id="new-label" class="form-in in-sm" placeholder="备注" aria-label="备注">
+          <label class="inline">优先级<input type="number" id="new-priority" class="form-in in-num" value="0" aria-label="优先级"></label>
+          <label class="inline">权重<input type="number" id="new-weight" class="form-in in-num" value="1" aria-label="权重"></label>
+          <button class="btn primary" type="submit">添加</button>
+        </form>
+        <p class="muted" id="add-msg" style="margin-top:8px"></p>
+
+        <table style="margin-top:20px">
+          <thead><tr>
+            <th>账号</th><th>状态</th><th class="r">优先级/权重</th><th class="r">请求</th>
+            <th>额度（5h / 周）</th><th class="r">操作</th>
+          </tr></thead>
+          <tbody id="acct-rows"></tbody>
+        </table>
+
+        <h3 style="margin-top:26px">审计</h3>
+        <table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>结果</th></tr></thead><tbody id="audit-rows"></tbody></table>
+      </div>
+    </section>
+
+    <section class="view" id="v-config" hidden>
+      <div class="kv" id="config-rows"><span class="sk w60"></span></div>
+    </section>
+
+    <footer>只读。密钥字段只显示前缀与摘要，不显示明文。</footer>
+  </main>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const POLL_MS = 2000;
+let timer = null, live = true;
+
+// 空值一律用 ASCII 连字符，不用 em-dash。
+// 时长用紧凑 ASCII（2m 33s）而不是「2 分 33 秒」：大号数值走等宽字体，
+// CJK 单位在中文字体里字距会被拉得很开，和数字不是一套字形。
+const DASH = '-';
+const fmtDur = (ms) => {
+  if (ms == null) return DASH;
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600);
+  const m = Math.floor(s % 3600 / 60), ss = s % 60;
+  if (d) return d + 'd ' + h + 'h';
+  if (h) return h + 'h ' + m + 'm';
+  if (m) return m + 'm ' + ss + 's';
+  return ss + 's';
+};
+const fmtTime = (ts) => {
+  if (!ts) return DASH;
+  const d = new Date(ts), p = (n) => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+};
+// 延迟一律取整到毫秒；亚毫秒才保留两位，避免 2.984 / 238.6837 这种原始浮点出现在大号数值里
+const fmtMs = (v) => (v == null ? DASH : (v < 1 ? v.toFixed(2) : String(Math.round(v))) + ' ms');
+const sev = (code) => (code >= 500 ? 'err' : code >= 400 ? 'warn' : '');
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+const clear = (n) => { while (n.firstChild) n.removeChild(n.firstChild); };
+
+// 只在数据变了才重绘：fn 用闭包取整个 overview，sig 只负责判重
+const sigs = {};
+function renderIfChanged(key, sig, fn) {
+  const s = JSON.stringify(sig);
+  if (sigs[key] === s) return;
+  sigs[key] = s;
+  fn();
+}
+// 空状态行（骨架屏在首次渲染时被整体替换掉）
+function emptyRow(tbody, cols, text) {
+  const tr = el('tr'), td = el('td', 'empty', text);
+  td.colSpan = cols; tr.appendChild(td); tbody.appendChild(tr);
+}
+
+// ── 运行状态 ───────────────────────────────────────────────
+function metric(label, value, sub, cls) {
+  const box = el('div');
+  box.appendChild(el('div', 'k', label));
+  box.appendChild(el('div', 'v' + (cls ? ' ' + cls : ''), value));
+  box.appendChild(el('div', 's', sub));
+  return box;
+}
+function renderStatus(d) {
+  const s = d.stats, c = d.core, r = s.requests, l = s.latency;
+  const cap = c.maxInflight > 0 ? c.maxInflight : null;
+  const box = $('metrics'); clear(box);
+  box.appendChild(metric('当前在途', r.inflight + ' / ' + (cap || '不限'),
+    '峰值 ' + r.inflightPeak, cap && r.inflight >= cap ? 'err' : ''));
+  box.appendChild(metric('请求总数', String(r.total), '成功 ' + r.succeeded + ' 失败 ' + r.failed));
+  box.appendChild(metric('成功率', r.successRate == null ? DASH : r.successRate + '%',
+    '采样 ' + l.samples, r.successRate == null ? '' : (r.successRate >= 99 ? 'ok' : r.successRate >= 90 ? 'warn' : 'err')));
+  box.appendChild(metric('延迟 p50', fmtMs(l.p50), '最大 ' + fmtMs(l.max)));
+  box.appendChild(metric('延迟 p95', fmtMs(l.p95), 'p99 ' + fmtMs(l.p99)));
+  box.appendChild(metric('运行时长', fmtDur(s.uptimeMs), 'pid ' + c.pid));
+
+  // 状态码：数字表格，不用带填充轨道的进度条
+  const sr = $('status-rows'); clear(sr);
+  if (!s.statuses.length) emptyRow(sr, 3, '还没有请求经过代理');
+  const total = s.statuses.reduce((a, x) => a + x.count, 0) || 1;
+  for (const row of s.statuses) {
+    const tr = el('tr');
+    const c1 = el('td', 'mono', String(row.code));
+    if (typeof row.code === 'number' && row.code >= 400) c1.classList.add(sev(row.code));
+    tr.appendChild(c1);
+    tr.appendChild(el('td', 'r mono', String(row.count)));
+    tr.appendChild(el('td', 'r mono muted', (row.count / total * 100).toFixed(1) + '%'));
+    sr.appendChild(tr);
+  }
+
+  const pr = $('path-rows'); clear(pr);
+  if (!s.paths.length) emptyRow(pr, 5, '暂无数据');
+  for (const p of s.paths) {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'mono', p.path));
+    tr.appendChild(el('td', 'r mono', String(p.total)));
+    tr.appendChild(el('td', 'r mono' + (p.failed ? ' warn' : ' muted'), String(p.failed)));
+    tr.appendChild(el('td', 'r mono muted', fmtMs(p.avgMs)));
+    tr.appendChild(el('td', 'r mono muted', fmtMs(p.maxMs)));
+    pr.appendChild(tr);
+  }
+}
+
+// ── 元信息：跟着当前视图走。留白分栏，不用中点串成一串 ─────
+function renderMeta(d, view) {
+  const c = d.core, s = d.stats, dev = d.device, e = s.errors;
+  const box = $('meta'); clear(box);
+  const item = (label, value) => {
+    const span = el('span');
+    if (label) span.appendChild(document.createTextNode(label + ' '));
+    span.appendChild(el('b', null, value));
+    return span;
+  };
+  box.appendChild(item('', (c.displayHost || c.host) + ':' + c.port));
+  if (view === 'device') {
+    box.appendChild(item('Key', dev.keyCount + ' 个'));
+    box.appendChild(item('活跃会话', dev.sessionCount + ' 个'));
+    box.appendChild(item('重报周期', '8h + 2h 抖动'));
+  } else if (view === 'errors') {
+    box.appendChild(item('累计', e.total + ' 条'));
+    box.appendChild(item('环形缓冲', '最近 ' + e.capacity + ' 条'));
+    box.appendChild(item('更新于', fmtTime(s.now)));
+  } else if (view === 'models') {
+    box.appendChild(item('内置', d.models.length + ' 个'));
+    box.appendChild(item('上游动态列表', c.useProviderModels ? '已开启' : '已关闭'));
+  } else if (view === 'accounts') {
+    const av = d.pool?.mode;
+    box.appendChild(item('账号池', d.pool?.enabled ? '已启用' : '未启用'));
+    if (d.pool?.enabled) {
+      box.appendChild(item('可用', (av?.usable ?? 0) + ' 个'));
+      box.appendChild(item('准入', d.pool.accessMode === 'whitelist' ? '白名单' : '开放'));
+    } else {
+      box.appendChild(item('启用方式', '设 CC_ADMIN_PASSWORD 后重启'));
+    }
+  } else if (view === 'config') {
+    box.appendChild(item('来源', 'config.json + 环境变量'));
+    box.appendChild(item('密钥字段', '已打码'));
+  } else {
+    box.appendChild(item('协议', c.protocolVersion));
+    box.appendChild(item('已运行', fmtDur(s.uptimeMs)));
+    box.appendChild(item('更新于', fmtTime(s.now)));
+  }
+}
+
+// ── 设备伪装 ───────────────────────────────────────────────
+const openKeys = new Set();
+function renderDevice(d) {
+  const dev = d.device, tb = $('device-rows'); clear(tb);
+  if (!dev.keys.length) { emptyRow(tb, 4, '还没有 Key 触发过预请求，指纹只在第一次真实请求时生成'); return; }
+
+  dev.keys.forEach((k, i) => {
+    const detailId = 'fp-' + i;
+    const isOpen = openKeys.has(k.keyPrefix);
+    const tr = el('tr', 'toggle');
+
+    const c1 = el('td');
+    const btn = el('button', 'expander', isOpen ? '-' : '+');
+    btn.type = 'button';
+    btn.setAttribute('aria-expanded', String(isOpen));
+    btn.setAttribute('aria-controls', detailId);
+    btn.setAttribute('aria-label', (isOpen ? '收起 ' : '展开 ') + k.keyPrefix + ' 的指纹明细');
+    c1.appendChild(btn);
+    c1.appendChild(el('span', 'mono', k.keyPrefix));
+    tr.appendChild(c1);
+
+    const c2 = el('td', 'mono');
+    c2.appendChild(document.createTextNode(k.fingerprintDigest || DASH));
+    c2.appendChild(el('span', 'cell-sub', 'sha256 前 12 位'));
+    tr.appendChild(c2);
+
+    tr.appendChild(el('td', 'mono', k.initialized ? fmtDur(k.nextInitInMs) : '待首次上报'));
+    const c4 = el('td', 'mono');
+    c4.appendChild(document.createTextNode(k.session ? k.session.sessionId : DASH));
+    if (k.session) c4.appendChild(el('span', 'cell-sub', '剩余 ' + fmtDur(k.session.expiresInMs)));
+    tr.appendChild(c4);
+
+    const det = el('tr', 'detail');
+    det.id = detailId;
+    det.hidden = !isOpen;
+    const dtd = el('td'); dtd.colSpan = 4;
+    const grid = el('div', 'components');
+    const comp = k.components || {};
+    const keys = Object.keys(comp);
+    if (!keys.length) grid.appendChild(el('div', 'muted', '无 components'));
+    for (const key of keys) {
+      const cell = el('div');
+      cell.appendChild(el('div', 'k', key));
+      const v = comp[key];
+      // 数组一项一行：直接丢 JSON 会带上引号方括号、折成一团，还把整行撑高
+      const text = Array.isArray(v) ? v.map(String).join('\n') : (typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v));
+      cell.appendChild(el('div', 'v', text));
+      grid.appendChild(cell);
+    }
+    const meta = el('div');
+    meta.appendChild(el('div', 'k', 'nextInitAt'));
+    meta.appendChild(el('div', 'v', k.nextInitAt ? new Date(k.nextInitAt).toLocaleString() : DASH));
+    grid.appendChild(meta);
+    dtd.appendChild(grid); det.appendChild(dtd);
+
+    const toggle = () => {
+      const open = openKeys.has(k.keyPrefix);
+      if (open) openKeys.delete(k.keyPrefix); else openKeys.add(k.keyPrefix);
+      btn.textContent = open ? '+' : '-';
+      btn.setAttribute('aria-expanded', String(!open));
+      det.hidden = open;
+    };
+    btn.addEventListener('click', (e) => { e.stopPropagation(); toggle(); });
+    tr.addEventListener('click', (e) => { if (e.target.closest('button')) return; toggle(); });
+    tr.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault(); toggle();
+    });
+
+    tb.appendChild(tr); tb.appendChild(det);
+  });
+}
+
+// ── 上游错误：带分页。这是唯一会长到几十行的视图，不再让它撑成一页 ──
+// 每页条数按视口高度算（表头 + 分页器 + 页脚约占 470px，行高 38px），
+// 这样「一页 = 一屏」在任何窗口高度下都成立，小屏不用为了按下一页再滚一下。
+// 450 / 40 是按实测标定的：每行 40px，其余（标题行+表头+分页器+页脚+内边距）实测约 435px
+const pageSize = () => Math.min(20, Math.max(5, Math.floor((window.innerHeight - 450) / 40)));
+let errPage = 1;
+function renderErrors(d) {
+  const e = d.stats.errors, tb = $('error-rows'); clear(tb);
+  const ps = pageSize();
+  const pages = Math.max(1, Math.ceil(e.tail.length / ps));
+  if (errPage > pages) errPage = pages;
+  if (errPage < 1) errPage = 1;
+  const from = (errPage - 1) * ps;
+  const slice = e.tail.slice(from, from + ps);
+  if (!slice.length) emptyRow(tb, 6, '没有上游错误');
+  for (const it of slice) {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'mono muted', fmtTime(it.at)));
+    tr.appendChild(el('td', 'mono', it.path));
+    const st = el('td', 'mono' + (it.status >= 400 ? ' ' + sev(it.status) : ''), String(it.status));
+    tr.appendChild(st);
+    tr.appendChild(el('td', 'mono', it.code || DASH));
+    tr.appendChild(el('td', 'mono muted', it.type || DASH));
+    const td = el('td');
+    const span = el('span', 'clip', it.message || DASH);
+    span.title = it.message || '';
+    td.appendChild(span); tr.appendChild(td);
+    tb.appendChild(tr);
+  }
+  $('page-pos').textContent = '第 ' + errPage + ' / ' + pages + ' 页，共 ' + e.tail.length + ' 条';
+  $('btn-prev').disabled = errPage <= 1;
+  $('btn-next').disabled = errPage >= pages;
+}
+
+// ── 模型 / 配置 ────────────────────────────────────────────
+function renderModels(d) {
+  const box = $('model-list'); clear(box);
+  for (const m of d.models) {
+    const row = el('div', 'model');
+    const id = el('span', 'id', m.id);
+    id.title = m.id;
+    row.appendChild(id);
+    if (m.name) row.appendChild(el('span', 'nm', m.name));
+    box.appendChild(row);
+  }
+}
+function renderConfig(d) {
+  const box = $('config-rows'); clear(box);
+  for (const [k, v] of Object.entries(d.config)) {
+    const pair = el('div', 'pair');
+    pair.appendChild(el('span', 'pk', k));
+    pair.appendChild(el('span', 'pv', v === null || v === '' ? DASH : typeof v === 'object' ? JSON.stringify(v) : String(v)));
+    box.appendChild(pair);
+  }
+}
+
+// ── 视图路由：hash 驱动，一次只挂一个视图（不再做单页长滚） ──
+// ── 账号池（P6）：管理会话 + 账号 CRUD + 准入 + 审计 ─────────
+const TITLES = { status: '运行状态', device: '设备伪装', errors: '上游错误', models: '模型', accounts: '账号', config: '配置' };
+const VIEWS = Object.keys(TITLES);
+const navLinks = Array.from(document.querySelectorAll('.nav a'));
+let current = null;
+let lastData = null;
+
+function renderActive() {
+  const d = lastData;
+  if (!d) return;
+  renderMeta(d, current);
+  $('nav-device').textContent = d.device.keyCount ? String(d.device.keyCount) : '';
+  $('nav-errors').textContent = d.stats.errors.total ? String(d.stats.errors.total) : '';
+  $('nav-models').textContent = d.models.length ? String(d.models.length) : '';
+  if (current === 'status') renderIfChanged('status', d.stats, () => renderStatus(d));
+  else if (current === 'device') renderIfChanged('device', d.device, () => renderDevice(d));
+  else if (current === 'errors') renderIfChanged('errors', { e: d.stats.errors, p: errPage, n: pageSize() }, () => renderErrors(d));
+  else if (current === 'models') renderIfChanged('models', d.models, () => renderModels(d));
+  else if (current === 'accounts') renderAccounts(d);
+  else if (current === 'config') renderIfChanged('config', d.config, () => renderConfig(d));
+}
+
+// ── 账号视图 ───────────────────────────────────────────────
+let acctAuthed = false;
+
+/** 管理 API 的统一入口：401 就退回登录态 */
+async function admin(path, init = {}) {
+  const res = await fetch('/api/console' + path, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
+  });
+  if (res.status === 401) { acctAuthed = false; renderAccounts(lastData); throw new Error('unauthorized'); }
+  let data = null;
+  try { data = await res.json(); } catch {}
+  if (!res.ok) throw new Error(data?.message || data?.error || ('HTTP ' + res.status));
+  return data;
+}
+
+function renderAccounts(d) {
+  const pool = d?.pool || { enabled: false };
+  $('nav-accounts').textContent = pool.enabled && pool.mode ? String(pool.mode.total) : '';
+  const off = $('pool-off'), login = $('pool-login'), panel = $('pool-panel');
+  off.hidden = login.hidden = panel.hidden = true;
+
+  if (!pool.enabled) {
+    off.hidden = false;
+    off.textContent = '账号池未启用。启动 console 时设置环境变量 CC_ADMIN_PASSWORD（≥8 位）即可开启多账号：'
+      + '池会接管上游 key 的选择，额度耗尽自动换号，凭据被拒自动封禁。';
+    return;
+  }
+  if (!acctAuthed) { login.hidden = false; return; }
+  panel.hidden = false;
+  loadAccounts().catch((e) => { $('login-msg').textContent = e.message; });
+}
+
+async function loadAccounts() {
+  const data = await admin('/accounts');
+  const av = data.availability;
+
+  // 概览
+  const m = $('pool-metrics'); clear(m);
+  const cell = (k, v, cls) => {
+    const b = el('div');
+    b.appendChild(el('div', 'k', k));
+    b.appendChild(el('div', 'v' + (cls ? ' ' + cls : ''), v));
+    return b;
+  };
+  m.appendChild(cell('可用', String(av.usable), av.usable ? 'ok-state' : 'bad-state'));
+  m.appendChild(cell('冷却中', String(av.cooling), av.cooling ? 'warn-state' : ''));
+  m.appendChild(cell('已封禁', String(av.banned), av.banned ? 'bad-state' : ''));
+  m.appendChild(cell('已停用', String(av.disabled)));
+  m.appendChild(cell('总计', String(av.total)));
+  m.appendChild(cell('重试上限', String(data.retryMax ?? lastData?.pool?.retryMax ?? 2) + ' 次'));
+
+  // 准入
+  for (const r of document.querySelectorAll('input[name=accmode]')) r.checked = r.value === data.accessMode;
+  const cr = $('client-rows'); clear(cr);
+  if (!data.accessClients.length) emptyRow(cr, 3, data.accessMode === 'open' ? '开放模式下不需要白名单' : '白名单为空，当前没有任何客户端被放行');
+  for (const c of data.accessClients) {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'mono', String(c.keyHash).slice(0, 16) + '…'));
+    tr.appendChild(el('td', null, c.label || DASH));
+    const td = el('td', 'r');
+    const btn = el('button', 'btn', '移除');
+    btn.type = 'button';
+    btn.addEventListener('click', async () => { await admin('/access/' + c.keyHash, { method: 'DELETE' }); loadAccounts(); });
+    td.appendChild(btn); tr.appendChild(td);
+    cr.appendChild(tr);
+  }
+
+  // 账号表
+  const tr2 = $('acct-rows'); clear(tr2);
+  if (!data.accounts.length) emptyRow(tr2, 6, '还没有账号。加一个上游 key 之后，池就会接管请求。');
+  for (const a of data.accounts) {
+    const tr = el('tr');
+
+    const c1 = el('td');
+    c1.appendChild(el('span', 'mono', a.hint));
+    c1.appendChild(el('span', 'cell-sub', a.label || '无备注'));
+    tr.appendChild(c1);
+
+    const stateText = { ready: '可用', cooling: '冷却中', banned: '已封禁', disabled: '已停用' }[a.state] || a.state;
+    const stateCls = { ready: 'ok-state', cooling: 'warn-state', banned: 'bad-state', disabled: 'muted' }[a.state] || '';
+    const c2 = el('td');
+    c2.appendChild(el('span', stateCls, stateText));
+    if (a.state === 'cooling' && a.cooldownUntil) {
+      // 冷却最该回答的是"还要等多久"，所以剩余时长在前、到期时刻在后
+      const left = a.cooldownUntil - Date.now();
+      const d = new Date(a.cooldownUntil), p = (n) => String(n).padStart(2, '0');
+      c2.appendChild(el('span', 'cell-sub',
+        `${a.cooldownReason} · 还剩 ${fmtDur(left)}（${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())} 到期）`));
+    }
+    if (a.state === 'banned') c2.appendChild(el('span', 'cell-sub', a.banReason || ''));
+    tr.appendChild(c2);
+
+    tr.appendChild(el('td', 'r mono', `${a.priority} / ${a.weight}`));
+
+    const c4 = el('td', 'r mono');
+    c4.appendChild(document.createTextNode(String(a.requests)));
+    c4.appendChild(el('span', 'cell-sub', `成 ${a.successes} 败 ${a.errors}`));
+    tr.appendChild(c4);
+
+    const c5 = el('td');
+    if (a.quota) {
+      const bar = el('div', 'quota-bar');
+      const one = (w) => (w && w.cap != null ? `${w.used ?? 0}/${w.cap}` : DASH);
+      bar.appendChild(el('span', null, '5h '));
+      bar.appendChild(el('b', null, one(a.quota.fiveHour)));
+      bar.appendChild(el('span', null, ' 周 '));
+      bar.appendChild(el('b', null, one(a.quota.weekly)));
+      bar.appendChild(el('span', null, ' 余额 '));
+      bar.appendChild(el('b', null, a.quota.monthlyLeft == null ? DASH : String(a.quota.monthlyLeft)));
+      c5.appendChild(bar);
+      c5.appendChild(el('span', 'cell-sub',
+        (a.quota.exceeded ? `被拦窗口 ${a.quota.exceeded} · ` : '') + '查询于 ' + fmtTime(a.quota.checkedAt) + (a.quota.stale ? '（已过期）' : '')));
+    } else c5.appendChild(el('span', 'muted', '未查询'));
+    tr.appendChild(c5);
+
+    const acts = el('td');
+    const box = el('div', 'act');
+    const mk = (label, fn, cls) => {
+      const b = el('button', 'btn' + (cls ? ' ' + cls : ''), label);
+      b.type = 'button';
+      b.addEventListener('click', async () => { try { await fn(); } catch (e) { $('login-msg').textContent = e.message; } await loadAccounts(); });
+      box.appendChild(b);
+    };
+    if (a.state === 'banned') mk('解封', () => admin(`/accounts/${a.keyHash}/unban`, { method: 'POST' }));
+    if (a.state === 'cooling') mk('清冷却', () => admin(`/accounts/${a.keyHash}/cooldown`, { method: 'POST' }));
+    mk('查额度', () => admin(`/accounts/${a.keyHash}/quota`, { method: 'POST' }));
+    mk('测连通', async () => {
+      const r = await admin(`/accounts/${a.keyHash}/test`, { method: 'POST' });
+      $('login-msg').textContent = r.ok ? `连通正常（org ${r.whoami?.orgId ?? DASH}）` : `连通失败：${r.error}`;
+      throw { message: $('login-msg').textContent, silent: true };
+    });
+    mk(a.enabled ? '停用' : '启用', () => admin(`/accounts/${a.keyHash}`, { method: 'PATCH', body: JSON.stringify({ enabled: !a.enabled }) }));
+    mk('删除', () => admin(`/accounts/${a.keyHash}`, { method: 'DELETE' }));
+    acts.appendChild(box);
+    tr.appendChild(acts);
+    tr2.appendChild(tr);
+  }
+
+  // 审计
+  const au = await admin('/audit?limit=40');
+  const ar = $('audit-rows'); clear(ar);
+  if (!au.rows.length) emptyRow(ar, 4, '暂无审计记录');
+  for (const r of au.rows) {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'mono muted', fmtTime(r.at)));
+    tr.appendChild(el('td', 'mono', r.action));
+    tr.appendChild(el('td', 'mono muted', r.target || DASH));
+    tr.appendChild(el('td', 'mono muted', r.outcome || DASH));
+    ar.appendChild(tr);
+  }
+}
+
+$('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('login-msg').textContent = '';
+  try {
+    const res = await fetch('/api/console/auth', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: $('pw').value }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { $('login-msg').textContent = data.message || '登录失败'; return; }
+    acctAuthed = true;
+    $('pw').value = '';
+    renderAccounts(lastData);
+  } catch (err) { $('login-msg').textContent = err.message; }
+});
+
+$('add-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const key = $('new-key').value.trim();
+  if (!key) return;
+  try {
+    const r = await admin('/accounts', { method: 'POST', body: JSON.stringify({
+      key, label: $('new-label').value.trim(),
+      priority: Number($('new-priority').value || 0), weight: Number($('new-weight').value || 1),
+    }) });
+    $('new-key').value = ''; $('new-label').value = '';
+    $('add-msg').textContent = r.created ? `已添加 ${r.hint}` : `已更新 ${r.hint}`;
+    await loadAccounts();
+  } catch (err) { $('add-msg').textContent = err.message; }
+});
+
+$('btn-add-client').addEventListener('click', async () => {
+  const key = $('new-client').value.trim();
+  if (!key) return;
+  try {
+    const r = await admin('/access', { method: 'POST', body: JSON.stringify({ key, label: '' }) });
+    $('new-client').value = '';
+    $('login-msg').textContent = `已加入白名单 ${r.hint}`;
+    await loadAccounts();
+  } catch (e) { $('login-msg').textContent = e.message; }
+});
+
+for (const r of document.querySelectorAll('input[name=accmode]')) {
+  r.addEventListener('change', async () => {
+    try { await admin('/access', { method: 'POST', body: JSON.stringify({ mode: r.value }) }); await loadAccounts(); }
+    catch (e) { $('login-msg').textContent = e.message; }
+  });
+}
+
+function route() {
+  const raw = (location.hash || '').replace(/^#\/?/, '');
+  const view = VIEWS.indexOf(raw) >= 0 ? raw : 'status';
+  if (view === current) return;
+  current = view;
+  for (const v of VIEWS) $('v-' + v).hidden = v !== view;
+  for (const a of navLinks) {
+    if (a.dataset.view === view) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  }
+  $('view-title').textContent = TITLES[view];
+  if (view === 'errors') errPage = 1;   // 每次进入这一页都从最新一页开始
+  window.scrollTo(0, 0);
+  renderActive();
+}
+window.addEventListener('hashchange', route);
+
+// 窗口高度变了 -> 每页条数变了 -> 错误页需要重排（去抖，避免拖动窗口时狂重绘）
+let rzTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(rzTimer);
+  rzTimer = setTimeout(() => { if (current === 'errors' && lastData) renderActive(); }, 150);
+});
+
+// 分页器（只影响错误视图；sig 里带了页码，所以翻页会走正常重绘路径）
+$('btn-prev').addEventListener('click', () => { if (errPage > 1) { errPage--; renderActive(); } });
+$('btn-next').addEventListener('click', () => { errPage++; renderActive(); });
+
+// ── 取数：区分「连不上」与「渲染失败」 ─────────────────────
+function setBanner(msg) {
+  const b = $('banner');
+  if (!msg) { b.hidden = true; b.textContent = ''; return; }
+  b.hidden = false;
+  b.textContent = msg;
+}
+async function tick() {
+  let d;
+  try {
+    const res = await fetch('/api/console/overview', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    d = await res.json();
+  } catch (e) {
+    setBanner('连不上控制台接口：' + e.message + '（代理本身可能仍在正常工作）');
+    return;
+  }
+  setBanner('');
+  lastData = d;
+  try {
+    renderActive();
+  } catch (e) {
+    setBanner('页面渲染失败：' + e.message);
+  }
+}
+
+// ── 轮询开关 ───────────────────────────────────────────────
+function start() {
+  if (timer) return;
+  live = true; $('btn-poll').textContent = '暂停';
+  $('chip-poll').textContent = '自动刷新 ' + (POLL_MS / 1000) + 's';
+  timer = setInterval(tick, POLL_MS);
+}
+function stop() {
+  if (!timer) return;
+  live = false; $('btn-poll').textContent = '继续';
+  $('chip-poll').textContent = '已暂停';
+  clearInterval(timer); timer = null;
+}
+$('btn-poll').addEventListener('click', () => (live ? stop() : start()));
+$('btn-now').addEventListener('click', tick);
+document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); else { start(); tick(); } });
+
+if (!location.hash) history.replaceState(null, '', '#/status');
+route();
+tick(); start();
+</script>
+</body>
+</html>
