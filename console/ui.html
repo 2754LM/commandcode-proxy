@@ -196,14 +196,28 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
 #pool-metrics .v{font-size:24px}
 .row-inline{display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-top:8px}
 .inline{display:flex;align-items:center;gap:6px;font-size:14px;color:var(--ink-2)}
-.act{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}
-.act button{font-size:13px;padding:3px 9px}
-.quota-bar{display:flex;gap:10px;font-family:var(--mono);font-size:12px;color:var(--muted)}
-.quota-bar b{color:var(--ink-2);font-weight:400}
 .bad-state{color:var(--err)} .warn-state{color:var(--warn)} .ok-state{color:var(--ok)}
-/* 账号表：第一列 shrink-to-fit，别让状态列的长文本把 hint 挤成两行 */
-#acct-rows td:first-child{width:1%;white-space:nowrap}
-#acct-rows .act{flex-wrap:nowrap}
+
+/* ── 账号卡片：一卡一账号，额度用条可视化 ─────────────────────
+   这是**配额计量**（用了多少 / 上限多少 / 何时重置），不是装饰性对比条。 */
+.acct-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:16px;margin-top:14px}
+.acct-card{border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px 12px;min-width:0}
+.acct-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.acct-head .hint{font-family:var(--mono);font-size:15px;color:var(--ink)}
+.acct-head .label-t{font-size:13px;color:var(--muted)}
+.acct-head .state{margin-left:auto;font-size:13px;white-space:nowrap}
+.acct-note{font-size:12px;color:var(--muted);font-family:var(--mono);margin-top:4px}
+.qrow{margin-top:12px}
+.qrow .qtop{display:flex;justify-content:space-between;gap:12px;font-family:var(--mono);font-size:12px;color:var(--muted)}
+.qrow .qtop b{color:var(--ink-2);font-weight:400}
+.qbar{height:4px;background:var(--line);margin-top:5px}
+.qbar i{display:block;height:100%;background:var(--ink-2)}
+.qbar i.warn{background:var(--warn)} .qbar i.err{background:var(--err)}
+.acct-meta{display:flex;gap:10px 18px;flex-wrap:wrap;font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:14px;padding-top:10px;border-top:1px solid var(--line)}
+.acct-meta b{color:var(--ink-2);font-weight:400}
+.acct-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+.sec-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.sec-head .small{font-size:12px}
 
 @media (max-width:1400px){
   .metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:24px 28px}
@@ -315,7 +329,10 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
 
       <div id="pool-login" hidden>
         <h3>需要管理口令</h3>
-        <p class="muted" style="margin:6px 0 14px">口令是启动 console 时的环境变量 <span class="mono">CC_ADMIN_PASSWORD</span>。写口（增删账号、解封、改准入）都要它。</p>
+        <p class="muted" style="margin:6px 0 14px">
+          口令是启动 console 时的环境变量 <span class="mono">CC_ADMIN_PASSWORD</span>。登录后可以：
+          <b>添加/删除账号</b>、解封、清冷却、看每个账号的<b>额度卡片</b>、改准入白名单。
+        </p>
         <form id="login-form" class="login">
           <input type="password" id="pw" class="form-in in-key" autocomplete="current-password" placeholder="管理口令" aria-label="管理口令">
           <button class="btn primary" type="submit">登录</button>
@@ -326,11 +343,26 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
       <div id="pool-panel" hidden>
         <div class="metrics" id="pool-metrics"></div>
 
-        <h3 style="margin-top:26px">准入</h3>
+        <div class="sec-head" style="margin-top:28px">
+          <h3 style="margin:0">账号</h3>
+          <span class="muted small">优先级数字小的先用；同优先级内按权重加权随机</span>
+        </div>
+        <form id="add-form" class="login" style="margin-top:12px">
+          <input type="text" id="new-key" class="form-in in-key" placeholder="上游 API key（user_…）" aria-label="上游 API key">
+          <input type="text" id="new-label" class="form-in in-sm" placeholder="备注" aria-label="备注">
+          <label class="inline">优先级<input type="number" id="new-priority" class="form-in in-num" value="0" aria-label="优先级"></label>
+          <label class="inline">权重<input type="number" id="new-weight" class="form-in in-num" value="1" aria-label="权重"></label>
+          <button class="btn primary" type="submit">添加账号</button>
+        </form>
+        <p class="muted" id="add-msg" style="margin-top:8px"></p>
+
+        <div class="acct-grid" id="acct-cards"></div>
+
+        <h3 style="margin-top:32px">准入</h3>
         <div class="row-inline">
           <label class="inline"><input type="radio" name="accmode" value="open"> 开放（任何带 key 的客户端）</label>
           <label class="inline"><input type="radio" name="accmode" value="whitelist"> 白名单</label>
-          <input type="text" id="new-client" placeholder="客户端 key（user_…）" aria-label="客户端 key">
+          <input type="text" id="new-client" class="form-in in-key" placeholder="客户端 key（user_…）" aria-label="客户端 key">
           <button class="btn" id="btn-add-client" type="button">加入白名单</button>
         </div>
         <table style="margin-top:8px">
@@ -338,25 +370,7 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
           <tbody id="client-rows"></tbody>
         </table>
 
-        <h3 style="margin-top:26px">添加账号</h3>
-        <form id="add-form" class="login" style="margin-top:8px">
-          <input type="text" id="new-key" class="form-in in-key" placeholder="上游 API key（user_…）" aria-label="上游 API key">
-          <input type="text" id="new-label" class="form-in in-sm" placeholder="备注" aria-label="备注">
-          <label class="inline">优先级<input type="number" id="new-priority" class="form-in in-num" value="0" aria-label="优先级"></label>
-          <label class="inline">权重<input type="number" id="new-weight" class="form-in in-num" value="1" aria-label="权重"></label>
-          <button class="btn primary" type="submit">添加</button>
-        </form>
-        <p class="muted" id="add-msg" style="margin-top:8px"></p>
-
-        <table style="margin-top:20px">
-          <thead><tr>
-            <th>账号</th><th>状态</th><th class="r">优先级/权重</th><th class="r">请求</th>
-            <th>额度（5h / 周）</th><th class="r">操作</th>
-          </tr></thead>
-          <tbody id="acct-rows"></tbody>
-        </table>
-
-        <h3 style="margin-top:26px">审计</h3>
+        <h3 style="margin-top:32px">审计</h3>
         <table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>结果</th></tr></thead><tbody id="audit-rows"></tbody></table>
       </div>
     </section>
@@ -724,61 +738,79 @@ async function loadAccounts() {
     cr.appendChild(tr);
   }
 
-  // 账号表
-  const tr2 = $('acct-rows'); clear(tr2);
-  if (!data.accounts.length) emptyRow(tr2, 6, '还没有账号。加一个上游 key 之后，池就会接管请求。');
+  // 账号卡片（一卡一账号；额度用条可视化，含重置倒计时）
+  const grid = $('acct-cards'); clear(grid);
+  if (!data.accounts.length) {
+    grid.appendChild(el('div', 'empty',
+      '还没有账号。把上游 key（user_…）粘到上面的输入框、点「添加账号」即可。之后池会自动接管请求：额度耗尽换号、凭据被拒封禁。'));
+  }
+  const STATE = {
+    ready: ['可用', 'ok-state'], cooling: ['冷却中', 'warn-state'],
+    banned: ['已封禁', 'bad-state'], disabled: ['已停用', 'muted'],
+  };
   for (const a of data.accounts) {
-    const tr = el('tr');
+    const [stateText, stateCls] = STATE[a.state] || [a.state, ''];
+    const card = el('div', 'acct-card');
 
-    const c1 = el('td');
-    c1.appendChild(el('span', 'mono', a.hint));
-    c1.appendChild(el('span', 'cell-sub', a.label || '无备注'));
-    tr.appendChild(c1);
+    const head = el('div', 'acct-head');
+    head.appendChild(el('span', 'hint', a.hint));
+    if (a.label) head.appendChild(el('span', 'label-t', a.label));
+    head.appendChild(el('span', 'state ' + stateCls, stateText));
+    card.appendChild(head);
 
-    const stateText = { ready: '可用', cooling: '冷却中', banned: '已封禁', disabled: '已停用' }[a.state] || a.state;
-    const stateCls = { ready: 'ok-state', cooling: 'warn-state', banned: 'bad-state', disabled: 'muted' }[a.state] || '';
-    const c2 = el('td');
-    c2.appendChild(el('span', stateCls, stateText));
+    // 状态说明：冷却给"还剩多久 + 到期时刻"，封禁给原因（这两个是人最需要马上看到的）
     if (a.state === 'cooling' && a.cooldownUntil) {
-      // 冷却最该回答的是"还要等多久"，所以剩余时长在前、到期时刻在后
-      const left = a.cooldownUntil - Date.now();
       const d = new Date(a.cooldownUntil), p = (n) => String(n).padStart(2, '0');
-      c2.appendChild(el('span', 'cell-sub',
-        `${a.cooldownReason} · 还剩 ${fmtDur(left)}（${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())} 到期）`));
+      card.appendChild(el('div', 'acct-note',
+        `${a.cooldownReason || 'cooling'} · 还剩 ${fmtDur(a.cooldownUntil - Date.now())}（${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())} 到期）`));
+    } else if (a.state === 'banned') {
+      card.appendChild(el('div', 'acct-note', a.banReason || '凭据被拒，需手动解封'));
     }
-    if (a.state === 'banned') c2.appendChild(el('span', 'cell-sub', a.banReason || ''));
-    tr.appendChild(c2);
 
-    tr.appendChild(el('td', 'r mono', `${a.priority} / ${a.weight}`));
+    const q = a.quota;
+    const windowRow = (name, w, resetAt) => {
+      const row = el('div', 'qrow');
+      const top = el('div', 'qtop');
+      top.appendChild(el('span', null, name));
+      const right = el('span');
+      right.appendChild(el('b', null, (w && w.cap != null) ? `${w.used ?? 0} / ${w.cap}` : DASH));
+      if (resetAt && resetAt > Date.now()) right.appendChild(document.createTextNode('   ' + fmtDur(resetAt - Date.now()) + ' 后重置'));
+      top.appendChild(right);
+      row.appendChild(top);
+      const bar = el('div', 'qbar');
+      const pct = (w && w.cap) ? Math.min(1, Math.max(0, (w.used ?? 0) / w.cap)) : 0;
+      const fill = el('i', pct >= 1 ? 'err' : (pct >= 0.8 ? 'warn' : ''));
+      fill.style.width = Math.round(pct * 100) + '%';
+      bar.appendChild(fill);
+      row.appendChild(bar);
+      return row;
+    };
+    if (q) {
+      card.appendChild(windowRow('5 小时窗口', q.fiveHour, q.fiveHour?.reset));
+      card.appendChild(windowRow('周窗口', q.weekly, q.weekly?.reset));
+    } else {
+      card.appendChild(el('div', 'acct-note', '未查询额度（点下面的「查额度」）'));
+    }
 
-    const c4 = el('td', 'r mono');
-    c4.appendChild(document.createTextNode(String(a.requests)));
-    c4.appendChild(el('span', 'cell-sub', `成 ${a.successes} 败 ${a.errors}`));
-    tr.appendChild(c4);
+    const meta = el('div', 'acct-meta');
+    const cell = (k, v) => { const s = el('span'); s.appendChild(document.createTextNode(k + ' ')); s.appendChild(el('b', null, v)); return s; };
+    meta.appendChild(cell('余额', q?.monthlyLeft == null ? DASH : String(q.monthlyLeft)));
+    if (q?.planId) meta.appendChild(cell('套餐', q.planId));
+    if (q?.exceeded) meta.appendChild(cell('被拦窗口', q.exceeded));
+    meta.appendChild(cell('优先级/权重', `${a.priority}/${a.weight}`));
+    meta.appendChild(cell('请求', `${a.requests}（成 ${a.successes} 败 ${a.errors}）`));
+    meta.appendChild(cell('上次使用', a.lastUsed ? fmtTime(a.lastUsed) : DASH));
+    card.appendChild(meta);
 
-    const c5 = el('td');
-    if (a.quota) {
-      const bar = el('div', 'quota-bar');
-      const one = (w) => (w && w.cap != null ? `${w.used ?? 0}/${w.cap}` : DASH);
-      bar.appendChild(el('span', null, '5h '));
-      bar.appendChild(el('b', null, one(a.quota.fiveHour)));
-      bar.appendChild(el('span', null, ' 周 '));
-      bar.appendChild(el('b', null, one(a.quota.weekly)));
-      bar.appendChild(el('span', null, ' 余额 '));
-      bar.appendChild(el('b', null, a.quota.monthlyLeft == null ? DASH : String(a.quota.monthlyLeft)));
-      c5.appendChild(bar);
-      c5.appendChild(el('span', 'cell-sub',
-        (a.quota.exceeded ? `被拦窗口 ${a.quota.exceeded} · ` : '') + '查询于 ' + fmtTime(a.quota.checkedAt) + (a.quota.stale ? '（已过期）' : '')));
-    } else c5.appendChild(el('span', 'muted', '未查询'));
-    tr.appendChild(c5);
-
-    const acts = el('td');
-    const box = el('div', 'act');
+    const acts = el('div', 'acct-actions');
     const mk = (label, fn, cls) => {
       const b = el('button', 'btn' + (cls ? ' ' + cls : ''), label);
       b.type = 'button';
-      b.addEventListener('click', async () => { try { await fn(); } catch (e) { $('login-msg').textContent = e.message; } await loadAccounts(); });
-      box.appendChild(b);
+      b.addEventListener('click', async () => {
+        try { await fn(); } catch (e) { if (!e?.silent) $('login-msg').textContent = e.message; }
+        await loadAccounts();
+      });
+      acts.appendChild(b);
     };
     if (a.state === 'banned') mk('解封', () => admin(`/accounts/${a.keyHash}/unban`, { method: 'POST' }));
     if (a.state === 'cooling') mk('清冷却', () => admin(`/accounts/${a.keyHash}/cooldown`, { method: 'POST' }));
@@ -786,13 +818,13 @@ async function loadAccounts() {
     mk('测连通', async () => {
       const r = await admin(`/accounts/${a.keyHash}/test`, { method: 'POST' });
       $('login-msg').textContent = r.ok ? `连通正常（org ${r.whoami?.orgId ?? DASH}）` : `连通失败：${r.error}`;
-      throw { message: $('login-msg').textContent, silent: true };
+      throw Object.assign(new Error(''), { silent: true });
     });
     mk(a.enabled ? '停用' : '启用', () => admin(`/accounts/${a.keyHash}`, { method: 'PATCH', body: JSON.stringify({ enabled: !a.enabled }) }));
     mk('删除', () => admin(`/accounts/${a.keyHash}`, { method: 'DELETE' }));
-    acts.appendChild(box);
-    tr.appendChild(acts);
-    tr2.appendChild(tr);
+    card.appendChild(acts);
+
+    grid.appendChild(card);
   }
 
   // 审计
