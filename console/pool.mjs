@@ -257,11 +257,19 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
 
   /**
    * 选一个可用账号。
-   * @param {{stickyKey?:string}} opts stickyKey 由调用方拼（PLAN Q4 建议 `client key + prompt_cache_key`）
+   * @param {{stickyKey?:string, exclude?:Set<string>}} opts
+   *   stickyKey 由调用方拼（PLAN Q4 建议 `client key + prompt_cache_key`）；
+   *   exclude 是"这次请求已经试过、别再给"的 keyHash 集合。
    * @returns {{ok:true,keyHash,key,hint,label,sticky:boolean}|{ok:false,...}}
    */
-  function pick({ stickyKey } = {}) {
-    const rows = candidates();
+  function pick({ stickyKey, exclude } = {}) {
+    let rows = candidates();
+    // 软失败（5xx 计数）不会把账号踢出候选，若不排除，"换号"就会原地重试同一个号。
+    // 只在**还有别的号**时才排除：池里只剩它自己就照旧用它，不误报"无可用账号"。
+    if (exclude && exclude.size) {
+      const rest = rows.filter((r) => !exclude.has(r.keyHash));
+      if (rest.length) rows = rest;
+    }
     if (!rows.length) return unavailable();
     const byHash = new Map(rows.map((r) => [r.keyHash, r]));
 

@@ -98,6 +98,18 @@ export function createPoolPlugin({ pool, hooks, access = null, quota = null, log
     let key = firstKey;
     let attempt = 0;
     let last = null;
+    const tried = new Set([state.keyHash]);  // 这次请求已经试过的号
+
+    /**
+     * 换号：先排除这次已经试过的号。冷静/封禁的号本来就不在候选里，
+     * 但 5xx 这类"软失败"只计数不冷却，不排除的话重试会撞回同一个号
+     * （尤其 priority 分层时：顶层只有一个号，weightedPick 必然又选它）。
+     * 排除后一个都不剩时退回普通选择：宁可重试同一个，也不误报无可用账号。
+     */
+    const pickNext = () => {
+      const fresh = pool.pick({ stickyKey: null, exclude: tried });
+      return fresh.ok ? fresh : pool.pick({ stickyKey: null });
+    };
 
     for (;;) {
       let res;
@@ -108,9 +120,9 @@ export function createPoolPlugin({ pool, hooks, access = null, quota = null, log
         pool.noteFailure(current.keyHash, { reason: `转发异常：${e.message}` });
         log('warn', 'forward threw, will try next account', { hint: current.hint, error: e.message });
         if (attempt >= maxRetries()) throw e;
-        const next = pool.pick({ stickyKey: null });
+        const next = pickNext();
         if (!next.ok) return unavailableResponse(next);
-        ({ key } = next); current = next; attempt++; continue;
+        ({ key } = next); current = next; attempt++; tried.add(next.keyHash); continue;
       }
 
       // 非 Response（/v1/models 的数组）：核心自己已经处理过错误并可能退回内置列表，
@@ -162,10 +174,10 @@ export function createPoolPlugin({ pool, hooks, access = null, quota = null, log
       }
 
       if (!cls.retryable || attempt >= maxRetries()) return last;
-      const next = pool.pick({ stickyKey: null });
+      const next = pickNext();
       if (!next.ok) return attempt === 0 ? unavailableResponse(next) : last;
       log('info', 'switching account and retrying', { from: current.hint, to: next.hint, attempt: attempt + 1 });
-      current = next; key = next.key; attempt++;
+      current = next; key = next.key; attempt++; tried.add(next.keyHash);
     }
   }
 
