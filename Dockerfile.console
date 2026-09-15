@@ -14,7 +14,8 @@
 #   - 不设 CC_ADMIN_PASSWORD 时，池不会启用，行为与单文件形态一致（只是多了 UI）
 #   - 口令丢失 = 账号密文无法解密（设计 D6 的取舍），请自行备份口令
 #   - console 默认只接受回环来源；容器里要访问 UI 请用
-#       docker exec -it <容器> wget -qO- http://127.0.0.1:3050/api/console/health
+#       docker exec -it <容器> wget -qO- http://127.0.0.1:3050/api/console/gate
+#       （/api/console/* 现在全部要管理会话，只有 /auth 登录与 /gate 探针公开）
 #     或在宿主机做端口转发后经 127.0.0.1 访问（设计 Q2：读口只认回环）
 FROM node:22-alpine
 

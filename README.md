@@ -15,6 +15,14 @@ Built by analyzing official CLI network traffic to accurately replicate the Comm
 ```bash
 npm start        # Start (the repo ships with config.json listening on http://0.0.0.0:3050)
 npm run dev      # Watch mode (auto-reload on file changes)
+
+# Optional: same port + a read-only console, no account pool
+node console/server.mjs
+
+# Optional: same port + console + multi-account pool behind one admin password
+# (Node >= 22.5 is required for the pool: it uses the built-in node:sqlite)
+CC_ADMIN_PASSWORD='at-least-8-chars' npm run console
+# → http://127.0.0.1:3050/console   (loopback only; password from the env var above)
 ```
 
 API Key is passed via the `Authorization` request header (or `x-api-key` for Anthropic SDKs) — no need to store it in config files. Key must start with `user_` (automatically matched with any prefix, e.g. `Bearer token_user_xxx`):
@@ -32,15 +40,24 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 commandcode/
 ├── config.json           # Port / log path etc.
 ├── LICENSE               # MIT License
-├── package.json          # npm start / npm run dev
-├── proxy.mjs             # Single-file proxy core (~1900 lines)
+├── package.json          # npm start / npm run dev / npm run console
+├── proxy.mjs             # Single-file proxy core
 ├── Dockerfile            # Container build (node:22-alpine)
+├── Dockerfile.console    # Container build for the console (same port, pool enabled)
 ├── docker-compose.yml    # Container orchestration
 ├── .dockerignore         # Build context exclusions
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml  # GHCR multi-arch publish on v* tags
-├── captured-requests/    # Captured CLI traffic (protocol analysis reference)
+├── console/              # Optional multi-account console (see below)
+│   ├── server.mjs        # Console server: mounts /console + /api/console on the same port
+│   ├── ui.html           # Single-file UI (no build step, zero runtime deps)
+│   ├── pool.mjs          # Account selection / cooldown / sticky binding
+│   ├── classify.mjs      # Upstream error classification (rotate or pass through)
+│   ├── quota.mjs         # Quota polling and window/reset parsing
+│   ├── plugin.mjs        # Wires the pool into proxy.mjs's hot-pluggable hooks
+│   ├── db.mjs crypto.mjs auth.mjs access.mjs stats.mjs
+│   └── accounts.mjs      # CLI for the pool
 ├── README.md             # This document (English)
 └── README_zh.md          # Chinese documentation
 ```
@@ -76,6 +93,12 @@ commandcode/
 | `CC_NONSTREAM_IDLE_MS` | Non-streaming upstream read idle timeout (default `90000`) |
 | `CC_MAX_INFLIGHT` | In-process concurrent request cap (default `0` = unlimited) |
 | `CMD_ZDR` | `zdr` (`1` to enable) |
+| `CC_ADMIN_PASSWORD` | Console admin password (>= 8 chars). **Setting it enables the account pool**; without it the console is read-only and the pool endpoints answer `501` |
+| `CC_POOL_DB` | Pool database path (default `console/pool.db`) |
+| `CC_POOL_WAKE` | Cooldown wake-up scheduler (`0` disables; default on) |
+| `CC_POOL_WAKE_TICK_MS` | Cooldown sweep interval floor (default `60000`) |
+| `CC_POOL_WAKE_GRACE_MS` | Conservative extension when the deadline re-check cannot reach the quota endpoint (default `300000`) |
+| `CC_POOL_VERBOSE` | `1` logs every account pick (off by default to avoid log spam) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -86,6 +109,36 @@ authority for actual retention and provider availability.
 **Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 
 > ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+
+## Console (optional, multi-account)
+
+The console mounts `/console` and `/api/console/*` onto the **same port** as the proxy
+(`node console/server.mjs` instead of `node proxy.mjs`) — the proxy listening behaviour is
+unchanged; `console/server.mjs` only swaps the request dispatcher and keeps the core intact.
+
+- **Loopback only.** Console routes answer `127.0.0.0/8` and `::1`; anything else gets `403`
+  with an explanatory body. Use an SSH tunnel to reach a remote box.
+- **One password guards everything.** When `CC_ADMIN_PASSWORD` is set, every
+  `/api/console/*` route (reads included) needs a session; only `POST /api/console/auth`
+  (login) and the `GET /api/console/gate` probe are public, plus the `/console` shell itself.
+  Without the variable there is no pool and the console is read-only: the core's read endpoints
+  stay open on loopback and the pool endpoints answer `501`.
+- **The password is also the encryption key.** Account keys are stored AES-256-GCM encrypted
+  with a scrypt-derived KEK. Changing the password makes previously stored accounts
+  undecryptable; losing it means those accounts are gone. The password is never written to disk.
+- **Rotation policy: only "this account is out of quota right now" rotates.** Quota exhaustion
+  (400 + quota semantics, 402, or a `rateLimit` envelope) and 429 cool the account down and
+  switch to another one. `401`/`403` and `5xx` are recorded against the account and passed
+  through to the client verbatim — they are not rotated, and nothing is ever auto-banned
+  (`markBan`/`unban` exist only as manual tools).
+- **Cooldowns recover on time.** A scheduler wakes at the nearest recovery deadline, re-checks
+  the quota endpoint, then either releases the account or extends the cooldown to the
+  authoritative reset time (so a guessed short cooldown cannot cause flapping).
+- Account **priority** picks the tier, **weight** is the odds inside that tier, and a client key
+  sticks to one account to keep prompt caching warm.
+
+The pool needs **Node >= 22.5** (`node:sqlite`). On older runtimes the pool step is skipped with
+an explicit error in the log — the proxy itself still works on Node 18+.
 
 ## API Endpoints
 

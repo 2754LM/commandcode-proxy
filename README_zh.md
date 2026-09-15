@@ -15,6 +15,14 @@
 ```bash
 npm start        # 启动（仓库自带 config.json，监听 http://0.0.0.0:3050）
 npm run dev      # watch 模式（文件修改自动重启）
+
+# 可选：同一个端口 + 只读控制台（不带账号池）
+node console/server.mjs
+
+# 可选：同一个端口 + 控制台 + 多账号池（用一道管理口令护住）
+# 账号池需要 Node >= 22.5（用内置 node:sqlite）
+CC_ADMIN_PASSWORD='至少八位的口令' npm run console
+# → http://127.0.0.1:3050/console   （只绑回环；口令就是上面那个环境变量）
 ```
 
 API Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`）传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
@@ -32,15 +40,24 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 commandcode/
 ├── config.json           # 端口 / 日志路径等
 ├── LICENSE               # MIT License
-├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1900 行）
+├── package.json          # npm start / npm run dev / npm run console
+├── proxy.mjs             # 单文件核心代理
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
+├── Dockerfile.console    # 控制台镜像（同端口，带账号池）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml  # 打 v* tag 时自动发布 GHCR 多架构镜像
-├── captured-requests/    # CLI 抓包数据（协议逆向参考）
+├── console/              # 可选的多账号控制台（详见下文）
+│   ├── server.mjs        # 控制台服务：在同一个端口上挂 /console 与 /api/console
+│   ├── ui.html           # 单文件界面（零构建、零运行时依赖）
+│   ├── pool.mjs          # 选号 / 冷却 / sticky 绑定
+│   ├── classify.mjs      # 上游错误分类（换号还是透传）
+│   ├── quota.mjs         # 额度轮询与窗口/重置时间解析
+│   ├── plugin.mjs        # 把账号池接进 proxy.mjs 的热插拔钩子
+│   ├── db.mjs crypto.mjs auth.mjs access.mjs stats.mjs
+│   └── accounts.mjs      # 账号池命令行
 ├── README.md             # 英文文档
 └── README_zh.md          # 本文档（中文）
 ```
@@ -76,6 +93,12 @@ commandcode/
 | `CC_NONSTREAM_IDLE_MS` | 非流式上游读空闲超时（默认 `90000`）|
 | `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
 | `CMD_ZDR` | `zdr`（`1` 开启） |
+| `CC_ADMIN_PASSWORD` | 控制台管理口令（≥8 位）。**设了它才启用账号池**；不设则控制台只读、池相关接口一律 `501` |
+| `CC_POOL_DB` | 账号池数据库路径（默认 `console/pool.db`） |
+| `CC_POOL_WAKE` | 冷却到点唤醒（`0` 关闭，默认开启） |
+| `CC_POOL_WAKE_TICK_MS` | 冷却扫描的兜底间隔（默认 `60000`） |
+| `CC_POOL_WAKE_GRACE_MS` | 到点复核联系不上额度接口时的保守续期（默认 `300000`） |
+| `CC_POOL_VERBOSE` | `1` 时每次选号都打日志（默认关，避免刷屏） |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -84,6 +107,26 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
+
+## 控制台（可选，多账号）
+
+控制台把 `/console` 与 `/api/console/*` 挂在**代理同一个端口**上（用 `node console/server.mjs`
+代替 `node proxy.mjs`）。核心的监听行为不变：console 只是把 request 分发器换掉，核心本身一行没为它让步。
+
+- **只绑回环**：控制台路由只响应 `127.0.0.0/8` 与 `::1`，其它来源一律 `403` 并附说明。要远程访问请用 SSH 隧道。
+- **一道口令管住整站**：设了 `CC_ADMIN_PASSWORD` 后，`/api/console/*` 的**全部**路由（含只读）都要会话；
+  只有 `POST /api/console/auth`（登录）与 `GET /api/console/gate`（探针）公开，外加 `/console` 外壳本身。
+  不设该变量则没有池、控制台只读：核心的只读接口在回环上照旧开放，池相关接口返回 `501`。
+- **口令同时是加密口令**：账号 key 用 scrypt 派生 KEK 做 AES-256-GCM 加密。**换口令 → 已存账号解不开；
+  忘口令 → 那些账号作废**。口令本身不落盘。
+- **轮换策略：只有"这个号此刻没额度了"才换号**。额度耗尽（400 + 额度语义 / 402 / `rateLimit` 信封）与
+  429 会冷却该号并换到别的号；`401`/`403` 与 `5xx` 只记账，原样透传给客户端 —— 不换号，也**永远不会自动封禁**
+  （`markBan`/`unban` 只是人工手段）。
+- **冷却到点自动恢复**：定时器对准最近的恢复时刻唤醒，先复核额度接口，再决定放行还是按上游给的权威时间续期
+  （所以"猜出来的 60s"不会造成来回抖）。
+- 选号：**优先级**决定层级、**权重**决定层内概率；同一个客户端 key 会粘在同一个账号上，保住 prompt 缓存。
+
+账号池需要 **Node ≥ 22.5**（`node:sqlite`）。更老的运行时上会跳过池并显式报错，代理本身在 Node 18+ 照常可用。
 
 ## API 接口
 

@@ -5,7 +5,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, realpathSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -3011,6 +3011,20 @@ async function handleResponses(req, res) {
 async function handleModels(req, res) {
   const apiKey = await resolveKey(req);
   const models = await forwardVia({ kind: 'models', req }, apiKey, (k) => fetchModels(k));
+  // 三条 chat 路径的钩子回传的是 Response，models 这条回传的是**解析好的数组**（fetchModels
+  // 自己处理错误并回退内置列表）。所以插件在这里若给出 Response（准入被拒 401 / 池里没有
+  // 可用账号 503），必须原样转给客户端 —— 否则下面 .map() 会对着 Response 崩成 500。
+  // 没装插件时 forwardVia 原样返回数组，这条分支永不进入（单文件模式行为不变）。
+  if (models && typeof models === 'object' && typeof models.ok === 'boolean'
+      && typeof models.clone === 'function') {
+    const body = await models.text().catch(() => '');
+    res.writeHead(models.status, {
+      'Content-Type': models.headers?.get?.('content-type') || 'application/json; charset=utf-8',
+      ...(models.headers?.get?.('retry-after') ? { 'Retry-After': models.headers.get('retry-after') } : {}),
+    });
+    res.end(body);
+    return;
+  }
   const now = nowUnix();
   sendJSON(res, 200, {
     object: 'list',
@@ -3102,8 +3116,21 @@ process.on('unhandledRejection', (reason) => {
 // 形态 A（单文件）：`node proxy.mjs` 自己启动监听，行为与之前完全一致。
 // 形态 B（带 UI）：`node console/server.mjs` 会 import 本模块并自行 listen，
 // 此时必须跳过这里的 listen —— 否则 import 后 ~45ms 就会占住端口（HANDOFF-webui.md §5 坑 2）。
-const isDirectRun = !!process.argv[1] &&
-  resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1]);
+//
+// 比较必须经得起符号链接与大小写差异：`npm link`、软链接、Windows 上盘符大小写不一致
+// （argv[1] 是 `d:\…`，import.meta.url 是 `D:\…`）都会让字面量不相等，而那样做的后果是
+// **静默不监听、进程直接退出**，最难排查。所以先比 realpath，再退化成大小写不敏感的绝对路径。
+function sameFile(a, b) {
+  if (!a || !b) return false;
+  try { if (realpathSync(a) === realpathSync(b)) return true; } catch { /* 路径不存在等，退化成字符串比较 */ }
+  const norm = (p) => {
+    const r = resolve(p);
+    return process.platform === 'win32' ? r.toLowerCase() : r;
+  };
+  return norm(a) === norm(b);
+}
+
+const isDirectRun = sameFile(process.argv[1], fileURLToPath(import.meta.url));
 
 if (isDirectRun) server.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {

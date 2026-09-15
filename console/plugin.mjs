@@ -26,7 +26,7 @@ export function createPoolPlugin({ pool, hooks, access = null, quota = null, log
   const picked = new WeakMap();       // req -> { keyHash, hint, label } | { none } | { deny }：钩子之间传请求级状态
   const configuredRetryMax = retryMax;
 
-  const maxRetries = () => configuredRetryMax ?? 2;
+  const maxRetries = () => configuredRetryMax ?? DEFAULT_RETRY_MAX;
   // 每次选号都打一行会刷屏（核心的 log 不过滤级别），所以单独给个开关
   const vlog = (...a) => { if (process.env.CC_POOL_VERBOSE === '1') log(...a); };
 
@@ -117,7 +117,7 @@ export function createPoolPlugin({ pool, hooks, access = null, quota = null, log
         res = await fn(key);
       } catch (e) {
         // 网络层错误：算这个账号一次失败，换号再试
-        pool.noteFailure(current.keyHash, { reason: `转发异常：${e.message}` });
+        pool.noteFailure(current.keyHash);          // 失败原因见下面这行日志
         log('warn', 'forward threw, will try next account', { hint: current.hint, error: e.message });
         if (attempt >= maxRetries()) throw e;
         const next = pickNext();
@@ -162,12 +162,12 @@ export function createPoolPlugin({ pool, hooks, access = null, quota = null, log
         }
         const finalUntil = until ?? (now() + 60_000);
         pool.markCooldown(current.keyHash, { untilMs: finalUntil, reason: cls.reason || 'fallback' });
-        pool.noteFailure(current.keyHash, { reason: `冷却：${cls.reason}` });
+        pool.noteFailure(current.keyHash);
         log('info', 'account cooled down', { hint: current.hint, reason: cls.reason, window: cls.window || null,
           source, until: new Date(finalUntil).toISOString() });
       } else if (cls.action === 'record') {
         // 记账后原样透传：这是"这个账号/上游出了问题"，不是"换个号就能成功"
-        pool.noteFailure(current.keyHash, { reason: cls.note || `HTTP ${res.status}` });
+        pool.noteFailure(current.keyHash);
         return res;
       } else {
         return res;                          // transparent：请求本身的问题，原样透传

@@ -25,8 +25,15 @@ const fmtWhen = (ms) => {
 /**
  * @param {{db:object, kek:Buffer, now?:()=>number, random?:()=>number}} opts
  */
-export function createPool({ db, kek, now = Date.now, random = Math.random }) {
+export function createPool({ db, kek, now = Date.now, random = Math.random, onCooldownChange = null }) {
   const sticky = new Map();   // stickyKey -> key_hash（内存态：重启后重新选，无信息损失）
+
+  /** 冷却状态变了就通知一声（可选）。控制台用它把"到点唤醒"的定时器对准最近的恢复时刻。
+   *  做成回调而不是让调用方去改写本对象的方法：池保持"显式工厂 + 一个入口"，调用方也不必猴补丁。 */
+  const notify = () => { if (onCooldownChange) { try { onCooldownChange(); } catch { /* 通知失败不影响冷却本身 */ } } };
+
+  /** 审计/日志里用的账号标签：优先 key_hint，账号已删就退化成 keyHash 前缀 */
+  const hintOf = (hash) => db.prepare('SELECT key_hint FROM accounts WHERE key_hash = ?').get(hash)?.key_hint || hash.slice(0, 8);
 
   // ── 凭证 ────────────────────────────────────────────────
   function addAccount({ key, label = '', priority = 0, weight = 1, enabled = true }) {
@@ -109,8 +116,8 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
                 ON CONFLICT(key_hash) DO UPDATE SET cooldown_until = excluded.cooldown_until,
                   cooldown_reason = excluded.cooldown_reason`)
       .run(hash, untilMs, r, now());
-    const hint = db.prepare('SELECT key_hint FROM accounts WHERE key_hash = ?').get(hash)?.key_hint || hash.slice(0, 8);
-    audit(db, { at: now(), action: 'pool.cooldown', target: hint, outcome: `${r} until ${fmtWhen(untilMs)}` });
+    audit(db, { at: now(), action: 'pool.cooldown', target: hintOf(hash), outcome: `${r} until ${fmtWhen(untilMs)}` });
+    notify();
     return { cooldownUntil: untilMs, reason: r };
   }
 
@@ -121,7 +128,7 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
                 ON CONFLICT(key_hash) DO UPDATE SET banned_at = excluded.banned_at,
                   ban_reason = excluded.ban_reason`)
       .run(hash, t, String(reason || '未注明'), t);
-    const hint = db.prepare('SELECT key_hint FROM accounts WHERE key_hash = ?').get(hash)?.key_hint || hash.slice(0, 8);
+    const hint = hintOf(hash);
     audit(db, { at: t, action: 'pool.ban', target: hint, outcome: String(reason || '') });
     for (const [k, v] of sticky) if (v === hash) sticky.delete(k);
     return { bannedAt: t, banReason: reason };
@@ -132,7 +139,7 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
     const row = db.prepare('SELECT ban_reason FROM state WHERE key_hash = ?').get(hash);
     if (!row) return false;
     db.prepare(`UPDATE state SET banned_at = 0, ban_reason = '', fail_streak = 0 WHERE key_hash = ?`).run(hash);
-    const hint = db.prepare('SELECT key_hint FROM accounts WHERE key_hash = ?').get(hash)?.key_hint || hash.slice(0, 8);
+    const hint = hintOf(hash);
     audit(db, { at: now(), action: 'pool.unban', target: hint, outcome: row.ban_reason || '' });
     return true;
   }
@@ -140,8 +147,9 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
   function clearCooldown(hash) {
     const changed = db.prepare('UPDATE state SET cooldown_until = 0, cooldown_reason = \'\' WHERE key_hash = ?').run(hash);
     if (changed.changes) {
-      const hint = db.prepare('SELECT key_hint FROM accounts WHERE key_hash = ?').get(hash)?.key_hint || hash.slice(0, 8);
+      const hint = hintOf(hash);
       audit(db, { at: now(), action: 'pool.cooldown.clear', target: hint, outcome: 'ok' });
+      notify();
     }
     return !!changed.changes;
   }
@@ -165,7 +173,7 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
    * 权威时间续上（而不是放行后立刻又撞限流）。两种结果都写审计，运维看得见"到点做过什么"。
    */
   function settleCooldown(hash, { recovered, untilMs = 0, reason = 'rate_limit', note = '' } = {}) {
-    const hint = db.prepare('SELECT key_hint FROM accounts WHERE key_hash = ?').get(hash)?.key_hint || hash.slice(0, 8);
+    const hint = hintOf(hash);
     const r = COOLDOWN_REASONS.has(reason) ? reason : 'fallback';
     if (recovered) {
       db.prepare("UPDATE state SET cooldown_until = 0, cooldown_reason = '' WHERE key_hash = ?").run(hash);
@@ -175,6 +183,7 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
     db.prepare('UPDATE state SET cooldown_until = ?, cooldown_reason = ? WHERE key_hash = ?').run(untilMs, r, hash);
     audit(db, { at: now(), action: 'pool.cooldown.expired', target: hint,
       outcome: `上游仍未恢复，续到 ${fmtWhen(untilMs)}${note ? `（${note}）` : ''}` });
+    notify();
     return { recovered: false, untilMs };
   }
 
@@ -187,17 +196,15 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
   /**
    * 记一次失败：**只计数**（requests / errors / fail_streak）。
    *
-   * 这里原本有"连续 N 次自动软封"和 hardBan 参数，已按业主决定移除 —— 自动路径不再
-   * 产生任何封禁。markBan / unban 仍作为**人工**手段保留（控制台/API 调用），但没有任何
-   * 自动流程会调它们，所以 banned 计数在实践中恒为 0。
+   * 这里原本有"连续 N 次自动软封"与 hardBan 参数，已按业主决定移除 —— 自动路径不再产生
+   * 任何封禁。markBan / unban 仍作为**人工**手段保留（控制台/API 调用），但没有任何自动
+   * 流程会调它们，所以 banned 计数在实践中恒为 0。
+   * 失败**原因**不在这里落库：它属于日志，由调用方（插件）自己打，避免高频写放大。
    */
-  function noteFailure(hash, { reason = '' } = {}) {
-    const t = now();
+  function noteFailure(hash) {
     db.prepare(`UPDATE state SET requests = requests + 1, errors = errors + 1,
-                fail_streak = fail_streak + 1, last_used = ? WHERE key_hash = ?`).run(t, hash);
-    void reason;   // 失败原因由调用方打日志，这里不落库（高频写不放大）
-    const streak = db.prepare('SELECT fail_streak FROM state WHERE key_hash = ?').get(hash)?.fail_streak || 0;
-    return { banned: false, failStreak: streak };
+                fail_streak = fail_streak + 1, last_used = ? WHERE key_hash = ?`).run(now(), hash);
+    return { failStreak: db.prepare('SELECT fail_streak FROM state WHERE key_hash = ?').get(hash)?.fail_streak || 0 };
   }
 
   // ── 选择（§8） ──────────────────────────────────────────

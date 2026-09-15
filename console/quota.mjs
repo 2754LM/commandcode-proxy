@@ -14,24 +14,12 @@
  *
  * 一切 best-effort：查不到就返回 null 并把原因写进 quota.last_error，绝不抛给转发路径。
  */
-import { toMs } from './classify.mjs';
+import { toMs, find } from './classify.mjs';
 
 const TIMEOUT_MS = 8000;
 
 // ── 字段容错：同一个语义在不同版本/端点里可能叫不同名字 ──────────
 const norm = (s) => String(s).toLowerCase().replace(/[_\-\s]/g, '');
-
-/** 在嵌套对象里按「归一化后的键名」找一个值（先本层，再往下钻） */
-export function find(node, names, depth = 0) {
-  if (!node || typeof node !== 'object' || depth > 6) return undefined;
-  const want = new Set(names.map(norm));
-  for (const [k, v] of Object.entries(node)) if (want.has(norm(k))) return v;
-  for (const v of Object.values(node)) {
-    const r = find(v, names, depth + 1);
-    if (r !== undefined) return r;
-  }
-  return undefined;
-}
 
 const numOf = (v) => {
   const n = typeof v === 'number' ? v : Number.parseFloat(String(v ?? ''));
@@ -47,10 +35,12 @@ const WINDOW_NAMES = {
 
 /**
  * 把 /alpha/billing/credits 的响应归一化成一行 quota。
- * @param raw      /alpha/billing/credits 的 body
- * @param planRaw  /alpha/billing/subscriptions 的 body（月总额的分母来源之一，可缺）
+ * @param raw     /alpha/billing/credits 的 body
+ * @param sources 其它三个端点的 body（都可缺）：{ subscription, whoami, usage }
+ *                月总额的分母与本期已用要从它们里取，见下方注释。
  */
-export function normalizeCredits(raw, planRaw = null) {
+export function normalizeCredits(raw, sources = {}) {
+  const { subscription: planRaw = null, whoami: orgRaw = null, usage: usageRaw = null } = sources || {};
   const credits = find(raw, ['credits']) || {};
   const wl = find(raw, ['windowLimits', 'windows', 'limits']) || {};
   const pickWindow = (names) => {
@@ -79,22 +69,35 @@ export function normalizeCredits(raw, planRaw = null) {
   const free = numOf(find(credits, ['freeCredits', 'free'])) ?? 0;
 
   /*
-   * 月额度是唯一"只有余额、没有上限"的窗口：上游 `credits` 里只有 monthlyCredits（余额）。
-   * 分母按 PROTOCOL-FACTS §14.2 取：
-   *   总额 = max(plan.monthlyCredits, credits.monthlyCredits) + purchased + free
-   * 若 windowLimits 直接给了 monthly（used/cap），以它为准 —— 那是服务端自己算的。
-   * 两个来源都没有 cap 时宁可**不给分母**（monthly.cap = null），UI 就不画进度条，
-   * 绝不用别的窗口的 cap 硬凑。
+   * 月额度是唯一"只有余额、没有上限"的窗口：上游 credits 里只有 monthlyCredits（余额）。
+   * 分母按可靠性依次取三个来源，拿不到就不给分母（cap = null，UI 不画进度条），
+   * 绝不用别的窗口的 cap 硬凑：
+   *   ① windowLimits.monthly.cap —— 服务端自己算的（若存在，最权威）
+   *   ② 余额 + 本期已用           —— 实测可推导：individual-go 的 8.2468545324（余额）
+   *                                  + 1.7483896696（usage.totalMonthlyCredits）= 10.0
+   *                                  这正是 §14.2 公式里 plan.monthlyCredits 的取值，
+   *                                  而我们没有那张套餐目录表，只能这样等价推算。
+   *   ③ plan.monthlyCredits       —— §14.2 的原文口径（实测 subscriptions 不带该字段，
+   *                                  保留是为了兼容将来/组织账号）
    */
   const monthWindow = pickWindow(WINDOW_NAMES.monthly);
   let monthCap = monthWindow.cap;
+  let monthCapSource = monthCap != null ? 'window' : null;
+  const usedThisPeriod = numOf(find(usageRaw, ['totalMonthlyCredits', 'monthlyCredits', 'totalCredits']));
+  if (monthCap == null && usedThisPeriod != null && monthlyLeft != null) {
+    monthCap = monthlyLeft + usedThisPeriod + purchased + free;
+    monthCapSource = 'balance+usage';
+  }
   if (monthCap == null) {
-    const planMonthly = numOf(find(planRaw, ['monthlyCredits', 'monthlyAllowance', 'monthlyLimit']));
-    if (planMonthly != null) monthCap = Math.max(planMonthly, monthlyLeft ?? 0) + purchased + free;
+    const planMonthly = numOf(find(planRaw, ['monthlyCredits', 'monthlyAllowance', 'monthlyLimit']))
+      ?? numOf(find(orgRaw, ['monthlyCredits', 'monthlyAllowance', 'monthlyLimit']));
+    if (planMonthly != null) { monthCap = Math.max(planMonthly, monthlyLeft ?? 0) + purchased + free; monthCapSource = 'plan'; }
   }
   const monthly = {
-    used: monthWindow.used ?? (monthCap != null && monthlyLeft != null ? Math.max(0, monthCap - monthlyLeft) : null),
+    // 本期已用：usage 给的就是权威值，否则用 总额 − 余额 反推
+    used: usedThisPeriod ?? (monthCap != null && monthlyLeft != null ? Math.max(0, monthCap - monthlyLeft) : null),
     cap: monthCap,
+    capSource: monthCapSource,
     reset: monthWindow.reset,          // 为空时由调用方用账期 currentPeriodEnd 补
     exceeded: monthWindow.exceeded,
   };
@@ -122,18 +125,25 @@ export function createQuota({ db, apiBase, now = Date.now, fetchImpl = fetch }) 
     return res.json();
   }
 
-  /** 拉一次四个端点（后面两个失败不致命） */
+  /**
+   * 拉一次四个端点。顺序按 §14.2 的依赖关系：
+   *   whoami(`?limits=1`) → 拿 orgId 与 orgLimits
+   *   credits(`?orgId=`)  ← 必需，失败即整次 refresh 失败
+   *   subscriptions(`?orgId=`) → 账期 currentPeriodStart/End（ISO 字符串）
+   *   usage(`?orgId=&since=<ISO>`) → 本期已用（since 必须 ISO，传 0 会被上游拒）
+   * 除 credits 外全部 best-effort：少一个来源只会让月额度分母取不到，不影响冷却。
+   */
   async function fetchAll(apiKey) {
     const out = { whoami: null, credits: null, subscription: null, usage: null, orgId: '' };
-    out.credits = await getJson('/alpha/billing/credits', apiKey);
-    out.whoami = await getJson('/alpha/whoami', apiKey).catch(() => null);
+    out.whoami = await getJson('/alpha/whoami?limits=1', apiKey).catch(() => null);
     out.orgId = String(find(out.whoami, ['orgId', 'organizationId', 'org']) ?? '');
-    if (out.orgId) {
-      out.subscription = await getJson(`/alpha/billing/subscriptions?orgId=${encodeURIComponent(out.orgId)}`, apiKey).catch(() => null);
-    } else {
-      out.subscription = await getJson('/alpha/billing/subscriptions', apiKey).catch(() => null);
-    }
-    out.usage = await getJson('/alpha/usage/summary', apiKey).catch(() => null);
+    const org = out.orgId ? `?orgId=${encodeURIComponent(out.orgId)}` : '';
+    out.credits = await getJson(`/alpha/billing/credits${org}`, apiKey);
+    out.subscription = await getJson(`/alpha/billing/subscriptions${org}`, apiKey).catch(() => null);
+    const since = find(out.subscription, ['currentPeriodStart', 'periodStart', 'startsAt']);
+    const sinceIso = typeof since === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(since) ? since : null;
+    out.usage = await getJson(`/alpha/usage/summary${org}${sinceIso ? `${org ? '&' : '?'}since=${encodeURIComponent(sinceIso)}` : ''}`, apiKey)
+      .catch(() => null);
     return out;
   }
 
@@ -142,7 +152,7 @@ export function createQuota({ db, apiBase, now = Date.now, fetchImpl = fetch }) 
     const t = now();
     try {
       const all = await fetchAll(apiKey);
-      const n = normalizeCredits(all.credits, all.subscription);
+      const n = normalizeCredits(all.credits, { subscription: all.subscription, whoami: all.whoami, usage: all.usage });
       const periodEnd = toMs(find(all.subscription, ['currentPeriodEnd', 'periodEnd', 'renewsAt', 'expiresAt'])) ?? 0;
       // 月窗口没有自己的 resetAt 时，账期结束就是它的重置时刻
       const monthReset = n.monthly.reset ?? periodEnd;

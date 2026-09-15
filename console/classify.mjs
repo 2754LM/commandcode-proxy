@@ -4,12 +4,19 @@
  * 纯函数：**不做任何 I/O**（不查库、不查额度、不发请求），只吃 (status, 原始 body 文本)
  * 吐出一个动作。挂在核心的 hooks.forward 里用，核心对此一无所知。
  *
- * 判定顺序**不能换**：
- *   1. 额度不足（400 + insufficient / 额度 code，或 402）→ 冷却至账期 → 换号
- *   2. 429（或限流 code）                                → 冷却至重置时间 → 换号
- *   3. 401 / 403                                        → 记账，原样透传，**不换号**
- *   4. 5xx                                              → 记账，原样透传，**不换号**
- *   5. 其他 4xx（含 422）                                → 原样透传，连账都不记
+ * 判定顺序**不能换**（与下面 classify() 的分支一一对应）：
+ *   0. `error.rateLimit` 信封在（任意状态码）        → 冷却（换号）   ← 最权威：上游自己说"没额度了"
+ *   1. 额度 code（USAGE_EXCEEDED 等，任意状态码）    → 冷却（换号）   ← 机器可读，同样权威
+ *   2. 额度**文案**，且状态码是 400 / 402 / 429      → 冷却（换号）   ← 真实样本的 code 为 null，只能靠文案
+ *   3. 402                                           → 冷却（换号）
+ *   4. 429 或限流 code                               → 冷却（换号）
+ *   5. 401 / 403                                     → 记账，原样透传，**不换号**
+ *   6. 5xx                                           → 记账，原样透传，**不换号**
+ *   7. 其他 4xx（含 422）                            → 原样透传，连账都不记
+ *
+ * 为什么文案那条要限状态码（第 2 条）：额度文案只是"弱信号"，一个 5xx 或 401 的 body 里
+ * 顺手出现 credits / quota 这种词并不稀奇，若不分状态码就换号，就会出现"上游整体故障时把
+ * 每个号挨个冷却一遍"。code 与 rateLimit 信封是上游显式声明，不受这条限制。
  *
  * 两条产品决策（业主 2026-09 明确）：
  *   - **只有「这个号暂时没额度了」才换号**：额度不足与 429 都是"换一个号就能继续服务"
@@ -169,26 +176,31 @@ export function inspect(bodyText) {
  * 万一上游哪天把这条换个状态码（400/403）返回，只要 err.rateLimit 在，就照样能识别。
  */
 export function windowOf(parsed) {
-  const rl = findNode(parsed, ['rateLimit', 'ratelimit', 'rate_limit']);
+  const rl = find(parsed, ['rateLimit', 'ratelimit', 'rate_limit'], 0, 2);
   if (!rl || typeof rl !== 'object') return null;
-  const w = String(findNode(rl, ['window', 'type', 'scope']) ?? '').toLowerCase();
+  const w = String(find(rl, ['window', 'type', 'scope'], 0, 2) ?? '').toLowerCase();
   return {
     name: w,
-    limit: Number(findNode(rl, ['limit', 'cap', 'total'])) || null,
-    remaining: (() => { const v = findNode(rl, ['remaining', 'left']); return v == null ? null : Number(v); })(),
-    reset: toMs(findNode(rl, ['reset', 'resetAt', 'resetsAt'])),
+    limit: Number(find(rl, ['limit', 'cap', 'total'], 0, 2)) || null,
+    remaining: (() => { const v = find(rl, ['remaining', 'left'], 0, 2); return v == null ? null : Number(v); })(),
+    reset: toMs(find(rl, ['reset', 'resetAt', 'resetsAt'], 0, 2)),
   };
 }
 
-/** 在对象里按（归一化）键名找第一个值，只往下钻两层：限流信封是固定形状，不需要深挖 */
-function findNode(node, names, depth = 0) {
-  if (!node || typeof node !== 'object' || depth > 2) return undefined;
+/**
+ * 在嵌套对象里按「归一化后的键名」找一个值（先本层，再往下钻）。
+ * 字段容错的公共工具：额度/计费端点与限流信封的字段名在版本间会漂，
+ * 各处都靠它按语义名取值（quota.mjs 也从这里 import，别再各写一份）。
+ * @param maxDepth 限流信封是固定形状（2 层足够）；额度响应更深，所以默认 6
+ */
+export function find(node, names, depth = 0, maxDepth = 6) {
+  if (!node || typeof node !== 'object' || depth > maxDepth) return undefined;
   const want = new Set(names.map((n) => String(n).toLowerCase().replace(/[_\-\s]/g, '')));
   for (const [k, v] of Object.entries(node)) {
     if (want.has(String(k).toLowerCase().replace(/[_\-\s]/g, ''))) return v;
   }
   for (const v of Object.values(node)) {
-    const r = findNode(v, names, depth + 1);
+    const r = find(v, names, depth + 1, maxDepth);
     if (r !== undefined) return r;
   }
   return undefined;
@@ -239,19 +251,20 @@ export function classify(status, bodyText, opts = {}) {
       note: `上游限流信封（${desc || '无细节'}）` + (reset ? '，已取到重置时间' : '，未给重置时间，需查额度接口') };
   }
 
-  // 2. 额度语义 —— **不看状态码**：只要 code 或文案说"没额度了"，就换号。
-  //    业主的要求是"只对额度不足做轮换"，判据就该是语义：上游给 400 还是 402/403 都是
-  //    同一件事（实测月度不足返 400 且 code=null，只能靠文案）。
-  const looksQuota = (info.code && QUOTA_CODES.has(info.code))
-    || /insufficient|quota|credits|usage limit|reached your|upgrade your plan|spend cap/i.test(info.message);
-  if (looksQuota) {
+  // 2. 额度语义 —— code 是上游显式声明，任意状态码都认；**纯文案**只认"额度类状态码"，
+  //    否则 5xx/401 的 body 里顺手出现 credits / quota 就会被误判成额度不足而白冷却账号。
+  const quotaCode = !!(info.code && QUOTA_CODES.has(info.code));
+  const quotaText = /insufficient|quota|credits|usage limit|reached your|upgrade your plan|spend cap/i.test(info.message);
+  const QUOTA_STATUSES = new Set([400, 402, 429]);
+  if (quotaCode || (quotaText && QUOTA_STATUSES.has(status))) {
     const q = parseResetTime(bodyText, { now, windowMs });
     return { ...base, action: 'cooldown', retryable: true, reason,
       cooldownUntil: capFor(q.at), needsQuotaQuery: q.at == null || q.fuzzy,
-      source: info.code && QUOTA_CODES.has(info.code) ? 'code' : (q.fuzzy ? 'text-clock' : 'text'),
+      source: quotaCode ? 'code' : (q.fuzzy ? 'text-clock' : 'text'),
       note: (q.at == null ? '重置时间未知，需查额度接口或走 60s 兜底'
         : (q.fuzzy ? '重置时间来自文案里的钟点（不精确），用额度接口校正' : null))
-        + (status !== 400 && status !== 402 ? `（HTTP ${status}，按额度语义处理）` : '') || null };
+        + (quotaCode && !QUOTA_STATUSES.has(status) ? `（HTTP ${status} 携带额度 code）` : '')
+        || null };
   }
 
   // 3. 付款/账期类状态码 —— 与额度同义，即使文案没命中

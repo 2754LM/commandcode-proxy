@@ -37,7 +37,21 @@ import * as stats from './stats.mjs';
 // 池完全通过 proxy.mjs 导出的 hooks 接入 —— 核心不认识它。
 let POOL = null;   // { db, pool, plugin, auth, access, quota, poller }
 
+/**
+ * node:sqlite 需要 Node ≥ 22.5。低于它时账号池起不来，而**静默降级**是最糟的结果：
+ * 用户以为口令生效了、账号存进去了，实际池根本没启用。所以先显式判断版本并给出可执行的提示。
+ */
+const SQLITE_MIN = [22, 5];
+function sqliteUnavailable() {
+  const [maj, min] = process.versions.node.split('.').map(Number);
+  if (maj > SQLITE_MIN[0]) return null;
+  if (maj === SQLITE_MIN[0] && min >= SQLITE_MIN[1]) return null;
+  return `Node ${process.versions.node} 没有内置 node:sqlite（需要 ≥ ${SQLITE_MIN.join('.')}）`;
+}
+
 async function enablePool() {
+  const why = sqliteUnavailable();
+  if (why) throw new Error(`${why} —— 账号池无法启用。升级 Node，或去掉 CC_ADMIN_PASSWORD 以只读模式运行。`);
   const [dbm, crypto, poolm, pluginm, authm, accessm, quotam] = await Promise.all([
     import('./db.mjs'), import('./crypto.mjs'), import('./pool.mjs'),
     import('./plugin.mjs'), import('./auth.mjs'), import('./access.mjs'), import('./quota.mjs'),
@@ -53,7 +67,9 @@ async function enablePool() {
     kv.set(db, 'kek_salt', salt);
   }
   const kek = crypto.deriveKek(process.env.CC_ADMIN_PASSWORD, salt);
-  const pool = poolm.createPool({ db, kek });
+  // onCooldownChange：池里冷却状态一变就通知，控制台据此把定时器对准最近的恢复时刻。
+  // 放在这里而不是让池认识"定时器"：池只负责"喊一声"，调度是 console 层的职责。
+  const pool = poolm.createPool({ db, kek, onCooldownChange: () => wakeTick() });
   const auth = authm.createAuth({ passphrase: process.env.CC_ADMIN_PASSWORD });
   const access = accessm.createAccess({ db });
   const quota = quotam.createQuota({ db, apiBase: CFG.apiBase });
@@ -81,7 +97,8 @@ async function enablePool() {
 //   2) 到点那一刻把额度刷新、状态清干净，控制台上的卡片和数字同时更新，不用等下一个请求。
 // 定时器**对准最近的恢复时刻**（不是每 N 秒轮询），所以"准时"是真的准时。
 const WAKE_CAP_MS = 24 * 3600_000;        // 单次 setTimeout 上限，更远的冷却分段唤醒
-const WAKE_TICK_MS = Math.max(1000, Number.parseInt(process.env.CC_POOL_WAKE_TICK_MS ?? '', 10) || 60_000);
+const WAKE_GRACE_MS = Math.max(1000, Number.parseInt(process.env.CC_POOL_WAKE_GRACE_MS ?? '', 10) || 5 * 60_000);   // 复核失败时的保守续期
+const WAKE_TICK_MS = Math.max(1000, Number.parseInt(process.env.CC_POOL_WAKE_TICK_MS ?? '', 10) || 60_000);          // 兜底扫描间隔
 let wakeTimer = null;
 let wakeFloor = 0;                        // 上次扫描的时间下界：每个到期时刻只复核一次
 let wakeArmed = false;
@@ -93,20 +110,34 @@ async function sweepExpiredCooldowns() {
   const rows = POOL.pool.listExpiredCooldowns(from);
   for (const r of rows) {
     const key = POOL.pool.revealKey(r.keyHash);
-    let verdict = null;
+    let verdict = null;          // stillExhausted 的结论：{until, window} = 仍没额度
+    let verified = false;        // 是否真的问到了上游（false = 查不到，不能当成"已恢复"）
+    let why = '';
     if (key) {
       try {
-        await POOL.quota.refresh(r.keyHash, key);
-        verdict = POOL.quota.stillExhausted(r.keyHash);
-      } catch (e) {
-        log('warn', 'cooldown wake: quota re-check failed', { hint: r.hint, error: e.message });
-      }
-    }
+        // 注意：quota.refresh 内部 try/catch，**失败不抛**，只回 {ok:false,error}。
+        // 只看"没抛异常"就当复核成功，会把上一次缓存的旧结论当成现在的结论 —— 必须查 ok。
+        const res = await POOL.quota.refresh(r.keyHash, key);
+        if (res && res.ok === false) why = res.error || '额度接口查询失败';
+        else { verdict = POOL.quota.stillExhausted(r.keyHash); verified = true; }
+      } catch (e) { why = e.message; }
+    } else why = '拿不到明文 key';
+
     if (verdict) {
-      POOL.pool.settleCooldown(r.keyHash, { recovered: false, untilMs: verdict.until, reason: 'rate_limit', note: `${verdict.window} 仍未恢复` });
-      log('info', 'cooldown hit deadline but upstream still limited', { hint: r.hint, window: verdict.window, until: new Date(verdict.until).toISOString() });
+      // 上游仍说没额度 → 按它给的权威时间续期（月额度续期也得记成 monthly，别一律写 rate_limit）
+      POOL.pool.settleCooldown(r.keyHash, { recovered: false, untilMs: verdict.until,
+        reason: r.reason || 'rate_limit', note: `${verdict.window} 仍未恢复` });
+      log('info', 'cooldown hit deadline but upstream still limited',
+        { hint: r.hint, window: verdict.window, until: new Date(verdict.until).toISOString() });
+    } else if (!verified) {
+      // 查不到 ≠ 已恢复：宁可保守续一小段，也不要写一条"已恢复"的假审计误导运维
+      const until = Date.now() + WAKE_GRACE_MS;
+      POOL.pool.settleCooldown(r.keyHash, { recovered: false, untilMs: until,
+        reason: r.reason || 'fallback', note: `复核失败（${why}），保守续 ${Math.round(WAKE_GRACE_MS / 1000)}s` });
+      log('warn', 'cooldown re-check failed, conservatively extended',
+        { hint: r.hint, error: why, until: new Date(until).toISOString() });
     } else {
-      POOL.pool.settleCooldown(r.keyHash, { recovered: true, note: key ? '到点复核：上游已恢复' : '到点自动恢复（拿不到明文 key，未复核）' });
+      POOL.pool.settleCooldown(r.keyHash, { recovered: true, note: '到点复核：上游已恢复' });
       log('info', 'cooldown expired, account back in rotation', { hint: r.hint });
     }
   }
@@ -141,12 +172,6 @@ function startWake() {
   if (process.env.CC_POOL_WAKE === '0') { log('info', 'cooldown wake disabled by CC_POOL_WAKE=0'); return; }
   wakeArmed = true;
   wakeFloor = Date.now();
-  // 新建冷却时立刻对准它的到期时刻。池没有事件回调可用，而调度属于 console 层的职责，
-  // 所以在这里包一层（插件拿的就是同一个对象），比让池去认识"定时器"要干净。
-  const markCooldown = POOL.pool.markCooldown;
-  POOL.pool.markCooldown = (...args) => { const r = markCooldown(...args); wakeTick(); return r; };
-  const settleCooldown = POOL.pool.settleCooldown;
-  POOL.pool.settleCooldown = (...args) => { const r = settleCooldown(...args); wakeTick(); return r; };
   wakeTick();
   const tick = setInterval(wakeTick, WAKE_TICK_MS);
   if (tick.unref) tick.unref();
@@ -171,7 +196,6 @@ if (process.env.CC_ADMIN_PASSWORD) {
 const UI_PATH = '/console';
 const API_PREFIX = '/api/console';
 const SNIFF_MAX_BYTES = 4096;
-const POLL_MS = 2000; // UI 轮询间隔（与 ui.html 保持一致，仅用于文案）
 
 const UI_HTML = readFileSync(new URL('./ui.html', import.meta.url), 'utf8');
 
@@ -383,10 +407,15 @@ async function handleAdmin(req, res, url) {
     if (m === 'PATCH' && !tail) {
       let body;
       try { body = await readJson(req); } catch (e) { return sendJSON(res, 400, { error: 'bad_body', message: e.message }); }
+      const before = POOL.pool.listAccounts().find((x) => x.keyHash === hash);
       const ok = POOL.pool.setAccount(hash, body);
       if (!ok) return sendJSON(res, 404, { error: 'not_found' });
-      POOL.pool.clearCooldown(hash);
-      return sendJSON(res, 200, { ok: true });
+      // 只有"把停用的号重新启用"才顺手清冷却（那等于明确说"让它重新上场"）。
+      // 改标签/权重/优先级**不该**动冷却：否则给一个因为限流正在冷却的号改个备注，
+      // 它就悄悄回到候选里，冷却形同虚设。要提前放行有专门的 清冷却 按钮。
+      let cleared = false;
+      if (body?.enabled === true && before && before.enabled === 0) cleared = POOL.pool.clearCooldown(hash);
+      return sendJSON(res, 200, { ok: true, cooldownCleared: cleared });
     }
     if (m === 'DELETE' && !tail) {
       const ok = POOL.pool.removeAccount(hash);
@@ -602,7 +631,6 @@ function buildCore() {
     pid: process.pid,
     node: process.version,
     startedAt: stats.snapshot().startedAt,
-    pollMs: POLL_MS,
   };
 }
 
