@@ -146,6 +146,38 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
     return !!changed.changes;
   }
 
+  /**
+   * 冷却刚到期的那一批（cooldown_until 落在 (sinceMs, now]），供"到点唤醒"复核。
+   * 只取启用中的账号：停用是我们自己的决定，不需要复核。
+   */
+  function listExpiredCooldowns(sinceMs = 0) {
+    return db.prepare(`
+      SELECT a.key_hash AS keyHash, a.key_hint AS hint,
+             COALESCE(s.cooldown_reason, '') AS reason, COALESCE(s.cooldown_until, 0) AS cooldownUntil
+      FROM accounts a JOIN state s ON s.key_hash = a.key_hash
+      WHERE a.enabled = 1 AND s.cooldown_until > ? AND s.cooldown_until <= ?
+    `).all(sinceMs, now());
+  }
+
+  /**
+   * 到点复核的结果落库。冷却本身是 lazy 的（选号时比时间），所以这不是恢复的必要条件；
+   * 它的价值是：真恢复了就把状态清干净（卡片不再显示"冷却中"），没恢复就按上游给的
+   * 权威时间续上（而不是放行后立刻又撞限流）。两种结果都写审计，运维看得见"到点做过什么"。
+   */
+  function settleCooldown(hash, { recovered, untilMs = 0, reason = 'rate_limit', note = '' } = {}) {
+    const hint = db.prepare('SELECT key_hint FROM accounts WHERE key_hash = ?').get(hash)?.key_hint || hash.slice(0, 8);
+    const r = COOLDOWN_REASONS.has(reason) ? reason : 'fallback';
+    if (recovered) {
+      db.prepare("UPDATE state SET cooldown_until = 0, cooldown_reason = '' WHERE key_hash = ?").run(hash);
+      audit(db, { at: now(), action: 'pool.cooldown.expired', target: hint, outcome: note || '到点自动恢复' });
+      return { recovered: true };
+    }
+    db.prepare('UPDATE state SET cooldown_until = ?, cooldown_reason = ? WHERE key_hash = ?').run(untilMs, r, hash);
+    audit(db, { at: now(), action: 'pool.cooldown.expired', target: hint,
+      outcome: `上游仍未恢复，续到 ${fmtWhen(untilMs)}${note ? `（${note}）` : ''}` });
+    return { recovered: false, untilMs };
+  }
+
   // ── 计数 ────────────────────────────────────────────────
   function noteSuccess(hash) {
     db.prepare(`UPDATE state SET requests = requests + 1, successes = successes + 1,
@@ -304,7 +336,7 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
 
   return {
     addAccount, removeAccount, setAccount, listAccounts, revealKey,
-    markCooldown, markBan, unban, clearCooldown,
+    markCooldown, markBan, unban, clearCooldown, listExpiredCooldowns, settleCooldown,
     noteSuccess, noteFailure,
     pick, availability, unavailable, stickySize,
   };

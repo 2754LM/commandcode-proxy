@@ -218,5 +218,33 @@ export function createQuota({ db, apiBase, now = Date.now, fetchImpl = fetch }) 
     return { at: null, source: 'none', detail: snap.lastError || 'no window resetAt' };
   }
 
-  return { refresh, get, fetchAll, cooldownUntilFor, normalizeCredits };
+  /**
+   * 该账号此刻是否仍然"没额度"—— 冷却到点复核用。
+   *
+   * 为什么需要它：冷却到点只是"我们猜的时间到了"，不代表上游真的放行。常见两种猜法：
+   *   - 上游没给重置时间 → 保守兜 60s
+   *   - 月度 → 账期结束（那是账期边界，不一定是额度恢复点）
+   * 到点先复核一次，真没恢复就按服务端给的时间续上，避免"放行 → 又撞限流"来回抖。
+   *
+   * @returns {{until:number, window:string}|null} 仍然耗尽则给出权威恢复时刻，否则 null
+   */
+  function stillExhausted(keyHash) {
+    const s = get(keyHash);
+    if (!s) return null;
+    const t = now();
+    const ok = (w, name) => (w && w.reset > t ? { until: w.reset, window: name } : null);
+    if (s.exceeded === 'fiveHour') return ok(s.fiveHour, 'fiveHour');
+    if (s.exceeded === 'weekly') return ok(s.weekly, 'weekly');
+    if (s.exceeded === 'monthly') return s.periodEnd > t ? { until: s.periodEnd, window: 'monthly' } : null;
+    // exceeded 没标（上游有时不打）：用用量兜底判断，但只在"确实顶到上限"时才算耗尽
+    for (const [w, name] of [[s.fiveHour, 'fiveHour'], [s.weekly, 'weekly']]) {
+      if (w && w.cap != null && w.used != null && w.used >= w.cap) {
+        const f = ok(w, name);
+        if (f) return f;
+      }
+    }
+    return null;
+  }
+
+  return { refresh, get, fetchAll, cooldownUntilFor, stillExhausted, normalizeCredits };
 }

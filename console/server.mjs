@@ -74,6 +74,84 @@ async function enablePool() {
   return { db, pool, plugin, auth, access, quota, poller, refreshAll, settings: kv };
 }
 
+// ── 冷却到点唤醒（punctual recovery）──────────────────────────
+// 冷却的正确性不依赖唤醒：选号时比 cooldown_until，到点自然回候选。唤醒解决的是另外两件事：
+//   1) 到点那一刻先问上游"到底恢复没有"，再决定放行还是续期 —— 否则 60s 兜底 / 账期这种
+//      "猜出来的时间"一到就放行，下一个请求立刻又撞限流，来回抖；
+//   2) 到点那一刻把额度刷新、状态清干净，控制台上的卡片和数字同时更新，不用等下一个请求。
+// 定时器**对准最近的恢复时刻**（不是每 N 秒轮询），所以"准时"是真的准时。
+const WAKE_CAP_MS = 24 * 3600_000;        // 单次 setTimeout 上限，更远的冷却分段唤醒
+const WAKE_TICK_MS = Math.max(1000, Number.parseInt(process.env.CC_POOL_WAKE_TICK_MS ?? '', 10) || 60_000);
+let wakeTimer = null;
+let wakeFloor = 0;                        // 上次扫描的时间下界：每个到期时刻只复核一次
+let wakeArmed = false;
+
+/** 复核所有"上次扫描之后到点"的冷却。返回处理条数 */
+async function sweepExpiredCooldowns() {
+  const from = wakeFloor;
+  wakeFloor = Date.now();
+  const rows = POOL.pool.listExpiredCooldowns(from);
+  for (const r of rows) {
+    const key = POOL.pool.revealKey(r.keyHash);
+    let verdict = null;
+    if (key) {
+      try {
+        await POOL.quota.refresh(r.keyHash, key);
+        verdict = POOL.quota.stillExhausted(r.keyHash);
+      } catch (e) {
+        log('warn', 'cooldown wake: quota re-check failed', { hint: r.hint, error: e.message });
+      }
+    }
+    if (verdict) {
+      POOL.pool.settleCooldown(r.keyHash, { recovered: false, untilMs: verdict.until, reason: 'rate_limit', note: `${verdict.window} 仍未恢复` });
+      log('info', 'cooldown hit deadline but upstream still limited', { hint: r.hint, window: verdict.window, until: new Date(verdict.until).toISOString() });
+    } else {
+      POOL.pool.settleCooldown(r.keyHash, { recovered: true, note: key ? '到点复核：上游已恢复' : '到点自动恢复（拿不到明文 key，未复核）' });
+      log('info', 'cooldown expired, account back in rotation', { hint: r.hint });
+    }
+  }
+  return rows.length;
+}
+
+/** 把定时器对准最近的恢复时刻 */
+function armWake() {
+  if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null; }
+  if (!POOL) return;
+  const a = POOL.pool.availability();
+  if (!a.cooling || a.nextRecoverMs <= 0) return;
+  const delay = Math.max(200, Math.min(a.nextRecoverMs, WAKE_CAP_MS));
+  wakeTimer = setTimeout(() => {
+    wakeTimer = null;
+    sweepExpiredCooldowns().catch((e) => log('warn', 'cooldown wake failed', { error: e.message })).finally(armWake);
+  }, delay);
+  if (wakeTimer.unref) wakeTimer.unref();
+}
+
+/** 一次完整的唤醒周期：先把"已经到点但没被定时器覆盖"的补上，再对准下一个时刻 */
+function wakeTick() {
+  if (!wakeArmed) return;
+  Promise.resolve()
+    .then(sweepExpiredCooldowns)
+    .catch((e) => log('warn', 'cooldown sweep failed', { error: e.message }))
+    .finally(armWake);
+}
+
+function startWake() {
+  if (wakeArmed || !POOL) return;
+  if (process.env.CC_POOL_WAKE === '0') { log('info', 'cooldown wake disabled by CC_POOL_WAKE=0'); return; }
+  wakeArmed = true;
+  wakeFloor = Date.now();
+  // 新建冷却时立刻对准它的到期时刻。池没有事件回调可用，而调度属于 console 层的职责，
+  // 所以在这里包一层（插件拿的就是同一个对象），比让池去认识"定时器"要干净。
+  const markCooldown = POOL.pool.markCooldown;
+  POOL.pool.markCooldown = (...args) => { const r = markCooldown(...args); wakeTick(); return r; };
+  const settleCooldown = POOL.pool.settleCooldown;
+  POOL.pool.settleCooldown = (...args) => { const r = settleCooldown(...args); wakeTick(); return r; };
+  wakeTick();
+  const tick = setInterval(wakeTick, WAKE_TICK_MS);
+  if (tick.unref) tick.unref();
+}
+
 if (process.env.CC_ADMIN_PASSWORD) {
   try {
     POOL = await enablePool();
@@ -82,6 +160,7 @@ if (process.env.CC_ADMIN_PASSWORD) {
       accessMode: POOL.access.mode(),
       db: process.env.CC_POOL_DB || '(default console/pool.db)',
     });
+    startWake();                       // 冷却到点唤醒：必须等 POOL 挂上之后
   } catch (e) {
     log('error', 'Failed to enable account pool, continuing in single-key mode', { error: e.message });
     POOL = null;

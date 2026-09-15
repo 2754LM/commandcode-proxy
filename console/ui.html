@@ -811,11 +811,12 @@ async function loadAccounts() {
     head.appendChild(el('span', 'state ' + stateCls, stateText));
     card.appendChild(head);
 
-    // 状态说明：冷却给"还剩多久 + 到期时刻"，封禁给原因（这两个是人最需要马上看到的）
+    // 状态说明：冷却给"还剩多久 + 到点自动恢复的时刻"（到点会先问上游复核再放行），
+    // 封禁给原因（那是唯一需要人工介入的状态）
     if (a.state === 'cooling' && a.cooldownUntil) {
       const d = new Date(a.cooldownUntil), p = (n) => String(n).padStart(2, '0');
       card.appendChild(el('div', 'acct-note',
-        `${a.cooldownReason || 'cooling'} · 还剩 ${fmtDur(a.cooldownUntil - Date.now())}（${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())} 到期）`));
+        `${a.cooldownReason || 'cooling'} · 还剩 ${fmtDur(a.cooldownUntil - Date.now())}（${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())} 自动恢复）`));
     } else if (a.state === 'banned') {
       card.appendChild(el('div', 'acct-note', a.banReason || '凭据被拒，需手动解封'));
     }
