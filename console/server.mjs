@@ -226,7 +226,7 @@ const accountView = (a) => {
     state: a.bannedAt ? 'banned' : (a.cooldownUntil > Date.now() ? 'cooling' : (a.enabled ? 'ready' : 'disabled')),
     quota: q ? {
       planId: q.planId, monthlyLeft: q.monthlyLeft, periodEnd: q.periodEnd,
-      fiveHour: q.fiveHour, weekly: q.weekly, exceeded: q.exceeded,
+      fiveHour: q.fiveHour, weekly: q.weekly, monthly: q.monthly, exceeded: q.exceeded,
       checkedAt: q.checkedAt, stale: q.stale, lastError: q.lastError,
     } : null,
   };

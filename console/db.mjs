@@ -73,6 +73,15 @@ CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC);
 `;
 
 /**
+ * 增量迁移：`CREATE TABLE IF NOT EXISTS` 不会给**已存在**的老库补列，
+ * 所以新增列必须显式 ALTER（用 PRAGMA 查一次，幂等）。
+ */
+function addColumn(db, table, col, decl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${decl}`);
+}
+
+/**
  * 打开（必要时创建）数据库。
  * @param {string} path 文件路径，或 ':memory:'（测试用）
  */
@@ -85,6 +94,9 @@ export function openDb(path) {
   try { db.exec('PRAGMA journal_mode = WAL'); } catch { /* :memory: 上不支持就跳过 */ }
   db.exec('PRAGMA synchronous = NORMAL');
   db.exec(SCHEMA);
+  // 月总额（分母）。5 小时 / 周窗口的上游本来就给 cap，月额度只有余额，
+  // 总额要么来自 windowLimits.monthly.cap，要么由 plan.monthlyCredits 推出来（§14.2）。
+  addColumn(db, 'quota', 'month_cap', 'REAL');
   return db;
 }
 

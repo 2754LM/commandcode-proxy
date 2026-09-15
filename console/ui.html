@@ -814,24 +814,30 @@ async function loadAccounts() {
     }
 
     const q = a.quota;
-    const windowRow = (name, w, resetAt) => {
+    // 右侧数字：有分母就 "used / cap"，没有就退回余额（月额度上游只给余额，见 quota.mjs）
+    const windowRow = (name, w, resetAt, fallback) => {
       const row = el('div', 'qrow');
       const top = el('div', 'qtop');
       top.appendChild(el('span', null, name));
       const right = el('span');
-      right.appendChild(el('b', null, (w && w.cap != null) ? `${w.used ?? 0} / ${w.cap}` : DASH));
+      const hasCap = !!(w && w.cap != null);
+      right.appendChild(el('b', null, hasCap ? `${w.used ?? 0} / ${w.cap}` : (fallback ?? DASH)));
       if (resetAt && resetAt > Date.now()) right.appendChild(document.createTextNode('   ' + fmtDur(resetAt - Date.now()) + ' 后重置'));
       top.appendChild(right);
       row.appendChild(top);
-      const bar = el('div', 'qbar');
-      const pct = (w && w.cap) ? Math.min(1, Math.max(0, (w.used ?? 0) / w.cap)) : 0;
-      const fill = el('i', pct >= 1 ? 'err' : (pct >= 0.8 ? 'warn' : ''));
-      fill.style.width = Math.round(pct * 100) + '%';
-      bar.appendChild(fill);
-      row.appendChild(bar);
+      if (hasCap) {
+        const bar = el('div', 'qbar');
+        const pct = Math.min(1, Math.max(0, (w.used ?? 0) / w.cap));
+        const fill = el('i', pct >= 1 ? 'err' : (pct >= 0.8 ? 'warn' : ''));
+        fill.style.width = Math.round(pct * 100) + '%';
+        bar.appendChild(fill);
+        row.appendChild(bar);
+      }
       return row;
     };
     if (q) {
+      card.appendChild(windowRow('月额度', q.monthly, q.monthly?.reset,
+        q.monthlyLeft == null ? DASH : `剩余 ${q.monthlyLeft}`));
       card.appendChild(windowRow('5 小时窗口', q.fiveHour, q.fiveHour?.reset));
       card.appendChild(windowRow('周窗口', q.weekly, q.weekly?.reset));
     } else {
@@ -840,7 +846,10 @@ async function loadAccounts() {
 
     const meta = el('div', 'acct-meta');
     const cell = (k, v) => { const s = el('span'); s.appendChild(document.createTextNode(k + ' ')); s.appendChild(el('b', null, v)); return s; };
-    meta.appendChild(cell('余额', q?.monthlyLeft == null ? DASH : String(q.monthlyLeft)));
+    // 上面「月额度」那行已经在显示余额时，这里就不再重复一遍
+    if (q?.monthly?.cap != null || q?.monthlyLeft == null) {
+      meta.appendChild(cell('余额', q?.monthlyLeft == null ? DASH : String(q.monthlyLeft)));
+    }
     if (q?.planId) meta.appendChild(cell('套餐', q.planId));
     if (q?.exceeded) meta.appendChild(cell('被拦窗口', q.exceeded));
     meta.appendChild(cell('优先级/权重', `${a.priority}/${a.weight}`));

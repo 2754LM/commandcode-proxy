@@ -42,10 +42,15 @@ const boolOf = (v) => (typeof v === 'boolean' ? v : v === 'true' ? true : v === 
 const WINDOW_NAMES = {
   fiveHour: ['fiveHour', 'fiveHours', 'fiveHourLimit', 'five_hour', 'hour5', 'fivelimit', 'hourly'],
   weekly: ['weekly', 'week', 'weeklyLimit', 'weekLimit', 'sevenDay', 'sevenDayLimit'],
+  monthly: ['monthly', 'monthlyLimit', 'monthWindow', 'month'],
 };
 
-/** 把 /alpha/billing/credits 的响应归一化成一行 quota */
-export function normalizeCredits(raw) {
+/**
+ * 把 /alpha/billing/credits 的响应归一化成一行 quota。
+ * @param raw      /alpha/billing/credits 的 body
+ * @param planRaw  /alpha/billing/subscriptions 的 body（月总额的分母来源之一，可缺）
+ */
+export function normalizeCredits(raw, planRaw = null) {
   const credits = find(raw, ['credits']) || {};
   const wl = find(raw, ['windowLimits', 'windows', 'limits']) || {};
   const pickWindow = (names) => {
@@ -68,13 +73,40 @@ export function normalizeCredits(raw) {
     else if (n.includes('month') || n.includes('period') || n.includes('credit')) exceeded = 'monthly';
     else exceeded = exceededRaw;
   }
+
+  const monthlyLeft = numOf(find(credits, ['monthlyCredits', 'monthly', 'monthlyLeft', 'remaining']));
+  const purchased = numOf(find(credits, ['purchasedCredits', 'purchased'])) ?? 0;
+  const free = numOf(find(credits, ['freeCredits', 'free'])) ?? 0;
+
+  /*
+   * 月额度是唯一"只有余额、没有上限"的窗口：上游 `credits` 里只有 monthlyCredits（余额）。
+   * 分母按 PROTOCOL-FACTS §14.2 取：
+   *   总额 = max(plan.monthlyCredits, credits.monthlyCredits) + purchased + free
+   * 若 windowLimits 直接给了 monthly（used/cap），以它为准 —— 那是服务端自己算的。
+   * 两个来源都没有 cap 时宁可**不给分母**（monthly.cap = null），UI 就不画进度条，
+   * 绝不用别的窗口的 cap 硬凑。
+   */
+  const monthWindow = pickWindow(WINDOW_NAMES.monthly);
+  let monthCap = monthWindow.cap;
+  if (monthCap == null) {
+    const planMonthly = numOf(find(planRaw, ['monthlyCredits', 'monthlyAllowance', 'monthlyLimit']));
+    if (planMonthly != null) monthCap = Math.max(planMonthly, monthlyLeft ?? 0) + purchased + free;
+  }
+  const monthly = {
+    used: monthWindow.used ?? (monthCap != null && monthlyLeft != null ? Math.max(0, monthCap - monthlyLeft) : null),
+    cap: monthCap,
+    reset: monthWindow.reset,          // 为空时由调用方用账期 currentPeriodEnd 补
+    exceeded: monthWindow.exceeded,
+  };
+
   return {
     planId: String(find(raw, ['planId', 'plan', 'planName', 'tier']) ?? ''),
-    monthlyLeft: numOf(find(credits, ['monthlyCredits', 'monthly', 'monthlyLeft', 'remaining'])),
-    purchased: numOf(find(credits, ['purchasedCredits', 'purchased'])),
-    free: numOf(find(credits, ['freeCredits', 'free'])),
+    monthlyLeft,
+    purchased,
+    free,
     fiveHour: pickWindow(WINDOW_NAMES.fiveHour),
     weekly: pickWindow(WINDOW_NAMES.weekly),
+    monthly,
     exceeded,
   };
 }
@@ -110,19 +142,23 @@ export function createQuota({ db, apiBase, now = Date.now, fetchImpl = fetch }) 
     const t = now();
     try {
       const all = await fetchAll(apiKey);
-      const n = normalizeCredits(all.credits);
+      const n = normalizeCredits(all.credits, all.subscription);
       const periodEnd = toMs(find(all.subscription, ['currentPeriodEnd', 'periodEnd', 'renewsAt', 'expiresAt'])) ?? 0;
-      db.prepare(`INSERT INTO quota (key_hash, plan_id, monthly_left, period_end, five_used, five_cap, five_reset,
+      // 月窗口没有自己的 resetAt 时，账期结束就是它的重置时刻
+      const monthReset = n.monthly.reset ?? periodEnd;
+      db.prepare(`INSERT INTO quota (key_hash, plan_id, monthly_left, month_cap, period_end, five_used, five_cap, five_reset,
                     week_used, week_cap, week_reset, exceeded, checked_at, last_error)
-                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'')
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'')
                   ON CONFLICT(key_hash) DO UPDATE SET plan_id=excluded.plan_id, monthly_left=excluded.monthly_left,
-                    period_end=excluded.period_end, five_used=excluded.five_used, five_cap=excluded.five_cap,
+                    month_cap=excluded.month_cap, period_end=excluded.period_end,
+                    five_used=excluded.five_used, five_cap=excluded.five_cap,
                     five_reset=excluded.five_reset, week_used=excluded.week_used, week_cap=excluded.week_cap,
                     week_reset=excluded.week_reset, exceeded=excluded.exceeded, checked_at=excluded.checked_at,
                     last_error=''`)
-        .run(keyHash, n.planId, n.monthlyLeft, periodEnd, n.fiveHour.used, n.fiveHour.cap, n.fiveHour.reset ?? 0,
+        .run(keyHash, n.planId, n.monthlyLeft, n.monthly.cap, periodEnd,
+          n.fiveHour.used, n.fiveHour.cap, n.fiveHour.reset ?? 0,
           n.weekly.used, n.weekly.cap, n.weekly.reset ?? 0, n.exceeded, t);
-      return { ok: true, ...n, periodEnd, checkedAt: t };
+      return { ok: true, ...n, monthly: { ...n.monthly, reset: monthReset }, periodEnd, checkedAt: t };
     } catch (e) {
       // 失败只记原因，不清空旧值（旧值还有参考价值）
       db.prepare(`INSERT INTO quota (key_hash, checked_at, last_error) VALUES (?,?,?)
@@ -140,6 +176,11 @@ export function createQuota({ db, apiBase, now = Date.now, fetchImpl = fetch }) 
       planId: r.plan_id, monthlyLeft: r.monthly_left, periodEnd: r.period_end,
       fiveHour: { used: r.five_used, cap: r.five_cap, reset: r.five_reset, exceeded: r.exceeded === 'fiveHour' },
       weekly: { used: r.week_used, cap: r.week_cap, reset: r.week_reset, exceeded: r.exceeded === 'weekly' },
+      monthly: {
+        // 分母为 null 就不要 used（宁可 UI 只显示余额，也不编一个数）
+        used: r.month_cap == null || r.monthly_left == null ? null : Math.max(0, r.month_cap - r.monthly_left),
+        cap: r.month_cap, left: r.monthly_left, reset: r.period_end, exceeded: r.exceeded === 'monthly',
+      },
       exceeded: r.exceeded, checkedAt: r.checked_at, stale: !r.checked_at || t - r.checked_at > 10 * 60_000,
       lastError: r.last_error || '',
     };
