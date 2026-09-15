@@ -437,6 +437,13 @@ let timer = null, live = true;
 // 时长用紧凑 ASCII（2m 33s）而不是「2 分 33 秒」：大号数值走等宽字体，
 // CJK 单位在中文字体里字距会被拉得很开，和数字不是一套字形。
 const DASH = '-';
+// 额度数字：上游会给出 1.2000000000000002 / 3.5999999999999996 这种浮点残渣，
+// 卡片上一律显示最多两位小数（额度不需要更高精度，多出来的位只会变成噪声）
+const num2 = (v) => {
+  const n = Number(v);
+  if (v == null || !Number.isFinite(n)) return DASH;
+  return String(Math.round(n * 100) / 100);
+};
 const fmtDur = (ms) => {
   if (ms == null) return DASH;
   const s = Math.max(0, Math.floor(ms / 1000));
@@ -821,7 +828,7 @@ async function loadAccounts() {
       top.appendChild(el('span', null, name));
       const right = el('span');
       const hasCap = !!(w && w.cap != null);
-      right.appendChild(el('b', null, hasCap ? `${w.used ?? 0} / ${w.cap}` : (fallback ?? DASH)));
+      right.appendChild(el('b', null, hasCap ? `${num2(w.used ?? 0)} / ${num2(w.cap)}` : (fallback ?? DASH)));
       if (resetAt && resetAt > Date.now()) right.appendChild(document.createTextNode('   ' + fmtDur(resetAt - Date.now()) + ' 后重置'));
       top.appendChild(right);
       row.appendChild(top);
@@ -837,7 +844,7 @@ async function loadAccounts() {
     };
     if (q) {
       card.appendChild(windowRow('月额度', q.monthly, q.monthly?.reset,
-        q.monthlyLeft == null ? DASH : `剩余 ${q.monthlyLeft}`));
+        q.monthlyLeft == null ? DASH : `剩余 ${num2(q.monthlyLeft)}`));
       card.appendChild(windowRow('5 小时窗口', q.fiveHour, q.fiveHour?.reset));
       card.appendChild(windowRow('周窗口', q.weekly, q.weekly?.reset));
     } else {
@@ -848,7 +855,7 @@ async function loadAccounts() {
     const cell = (k, v) => { const s = el('span'); s.appendChild(document.createTextNode(k + ' ')); s.appendChild(el('b', null, v)); return s; };
     // 上面「月额度」那行已经在显示余额时，这里就不再重复一遍
     if (q?.monthly?.cap != null || q?.monthlyLeft == null) {
-      meta.appendChild(cell('余额', q?.monthlyLeft == null ? DASH : String(q.monthlyLeft)));
+      meta.appendChild(cell('余额', num2(q?.monthlyLeft)));
     }
     if (q?.planId) meta.appendChild(cell('套餐', q.planId));
     if (q?.exceeded) meta.appendChild(cell('被拦窗口', q.exceeded));

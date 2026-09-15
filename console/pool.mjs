@@ -12,7 +12,6 @@
 import { encrypt, decrypt, keyHash, keyHint } from './crypto.mjs';
 import { settings, audit } from './db.mjs';
 
-const DEFAULT_BAN_FAIL_THRESHOLD = 5;   // PLAN Q1 建议值 5（可被 settings 覆盖）
 const STICKY_MAX = 1000;                // sticky 绑定表上限，防无界增长（超出按插入顺序淘汰）
 
 const COOLDOWN_REASONS = new Set(['monthly', 'rate_limit', 'fallback']);
@@ -28,9 +27,6 @@ const fmtWhen = (ms) => {
  */
 export function createPool({ db, kek, now = Date.now, random = Math.random }) {
   const sticky = new Map();   // stickyKey -> key_hash（内存态：重启后重新选，无信息损失）
-
-  const banThreshold = () =>
-    settings.getInt(db, 'ban_fail_threshold', DEFAULT_BAN_FAIL_THRESHOLD);
 
   // ── 凭证 ────────────────────────────────────────────────
   function addAccount({ key, label = '', priority = 0, weight = 1, enabled = true }) {
@@ -157,24 +153,19 @@ export function createPool({ db, kek, now = Date.now, random = Math.random }) {
   }
 
   /**
-   * 记一次失败。返回是否因此封禁 —— P2 的错误分类把 401/403 硬封、5xx 计数，
-   * 都在调用方判定，这里只负责"计数 + 到阈值就封"。
+   * 记一次失败：**只计数**（requests / errors / fail_streak）。
+   *
+   * 这里原本有"连续 N 次自动软封"和 hardBan 参数，已按业主决定移除 —— 自动路径不再
+   * 产生任何封禁。markBan / unban 仍作为**人工**手段保留（控制台/API 调用），但没有任何
+   * 自动流程会调它们，所以 banned 计数在实践中恒为 0。
    */
-  function noteFailure(hash, { hardBan = false, reason = '' } = {}) {
+  function noteFailure(hash, { reason = '' } = {}) {
     const t = now();
     db.prepare(`UPDATE state SET requests = requests + 1, errors = errors + 1,
                 fail_streak = fail_streak + 1, last_used = ? WHERE key_hash = ?`).run(t, hash);
-    if (hardBan) {
-      markBan(hash, reason || '凭据被拒');
-      return { banned: true, failStreak: 0, threshold: banThreshold() };
-    }
+    void reason;   // 失败原因由调用方打日志，这里不落库（高频写不放大）
     const streak = db.prepare('SELECT fail_streak FROM state WHERE key_hash = ?').get(hash)?.fail_streak || 0;
-    const threshold = banThreshold();
-    if (streak >= threshold) {
-      markBan(hash, reason || `连续 ${streak} 次上游 5xx`);
-      return { banned: true, failStreak: streak, threshold };
-    }
-    return { banned: false, failStreak: streak, threshold };
+    return { banned: false, failStreak: streak };
   }
 
   // ── 选择（§8） ──────────────────────────────────────────

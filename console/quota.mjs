@@ -187,10 +187,14 @@ export function createQuota({ db, apiBase, now = Date.now, fetchImpl = fetch }) 
   }
 
   /**
-   * §4.4 第 2 级回退：上游 body 没给重置时间时，查额度接口拿权威答案。
+   * 第 2 级回退：上游 body 没给（可信的）重置时间时，查额度接口拿权威答案。
+   * @param reason     'monthly' | 'rate_limit' | 'fallback'
+   * @param windowHint 'fiveHour' | 'weekly' | '' —— body 里认出来的窗口。
+   *   有这个提示时必须**优先取该窗口自己的重置时间**：否则"取所有窗口里最晚的"
+   *   会把一次 5 小时限流冷却成周窗口的 6 天。
    * @returns {{at:number|null, source:string, detail?:string}}
    */
-  async function cooldownUntilFor(keyHash, apiKey, reason = 'fallback') {
+  async function cooldownUntilFor(keyHash, apiKey, reason = 'fallback', windowHint = '') {
     let snap = get(keyHash);
     if (!snap || snap.stale) await refresh(keyHash, apiKey);
     snap = get(keyHash);
@@ -198,6 +202,11 @@ export function createQuota({ db, apiBase, now = Date.now, fetchImpl = fetch }) 
     if (reason === 'monthly') {
       const at = snap.periodEnd > now() ? snap.periodEnd : null;
       return { at, source: at ? 'quota:periodEnd' : 'none', detail: snap.planId };
+    }
+    // body 说清了是哪个窗口 → 直接取该窗口的重置时间
+    if (windowHint === 'fiveHour' || windowHint === 'weekly') {
+      const w = windowHint === 'fiveHour' ? snap.fiveHour : snap.weekly;
+      if (w && w.reset > now()) return { at: w.reset, source: `quota:${windowHint}` };
     }
     // 限流：看服务端权威标记的 exceeded 指向哪个窗口
     const which = snap.exceeded;

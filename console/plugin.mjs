@@ -6,16 +6,16 @@
  *
  *   客户端请求 → 核心 resolveKey 钩子 → 池选账号（sticky / priority / weight）
  *              → 核心 forwardVia 钩子 → 发上游 → 非 2xx 就分类
- *                  ├─ transparent（普通 400/422）→ 原样返回，不换号
- *                  ├─ ban（401/403）            → 封禁该账号 → 换号重试
- *                  ├─ cooldown（额度/限流）      → 冷却该账号 → 换号重试
- *                  └─ count（5xx）              → fail_streak++ → 换号重试
+ *                  ├─ cooldown（额度不足 / 窗口限流）→ 冷却该账号 → 换号重试
+ *                  ├─ record（401/403/5xx）        → 只记账，原样透传，**不换号**
+ *                  └─ transparent（其他 4xx）      → 原样透传，不记账
  *              换号后仍失败 / 池空 → 返回一个「像上游响应」的 503，让核心既有的错误映射
  *              把说明原样带给客户端（带 code=NO_AVAILABLE_ACCOUNT）
  *
  * 策略：
  *   - 池里**一个账号都没有** → 不接管（resolveKey 返回 undefined），单 key 模式照旧可用
  *   - 池里有账号但全部不可用 → 503，**绝不悄悄退回客户端 key**（否则用户以为在走池）
+ *   - 只有"这个号暂时没额度了"（额度不足 / 窗口限流）才换号；401/403/5xx 不换号、不封禁
  */
 import { classify } from './classify.mjs';
 
@@ -147,15 +147,14 @@ export function createPoolPlugin({ pool, hooks, access = null, quota = null, log
         needsQuotaQuery: cls.needsQuotaQuery,
       });
 
-      if (cls.action === 'ban') {
-        pool.noteFailure(current.keyHash, { hardBan: true, reason: cls.note || `HTTP ${res.status}` });
-      } else if (cls.action === 'cooldown') {
+      if (cls.action === 'cooldown') {
         let until = cls.cooldownUntil;
         let source = cls.source;
-        // §4.4 第 2 级回退：上游没给重置时间 → 查额度接口拿权威答案（best-effort，失败就退回兜底）
+        // 第 2 级回退：上游没给（可信的）重置时间 → 查额度接口拿权威答案
+        // （把 body 里认出来的窗口一起传过去，避免把 5 小时限流冷却成周窗口的 6 天）
         if (cls.needsQuotaQuery && quota) {
           try {
-            const q = await quota.cooldownUntilFor(current.keyHash, key, cls.reason);
+            const q = await quota.cooldownUntilFor(current.keyHash, key, cls.reason, cls.window);
             if (q.at) { until = q.at; source = q.source; }
           } catch (e) {
             log('warn', 'quota fallback failed', { hint: current.hint, error: e.message });
@@ -164,11 +163,12 @@ export function createPoolPlugin({ pool, hooks, access = null, quota = null, log
         const finalUntil = until ?? (now() + 60_000);
         pool.markCooldown(current.keyHash, { untilMs: finalUntil, reason: cls.reason || 'fallback' });
         pool.noteFailure(current.keyHash, { reason: `冷却：${cls.reason}` });
-        log('info', 'account cooled down', { hint: current.hint, reason: cls.reason, source,
-          until: new Date(finalUntil).toISOString() });
-      } else if (cls.action === 'count') {
-        const r = pool.noteFailure(current.keyHash, { reason: cls.note || `HTTP ${res.status}` });
-        if (r.banned) log('warn', 'account soft-banned by fail_streak', { hint: current.hint, streak: r.failStreak });
+        log('info', 'account cooled down', { hint: current.hint, reason: cls.reason, window: cls.window || null,
+          source, until: new Date(finalUntil).toISOString() });
+      } else if (cls.action === 'record') {
+        // 记账后原样透传：这是"这个账号/上游出了问题"，不是"换个号就能成功"
+        pool.noteFailure(current.keyHash, { reason: cls.note || `HTTP ${res.status}` });
+        return res;
       } else {
         return res;                          // transparent：请求本身的问题，原样透传
       }
