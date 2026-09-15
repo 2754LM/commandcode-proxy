@@ -218,6 +218,7 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
 .acct-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
 .sec-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
 .sec-head .small{font-size:12px}
+#pool-login{margin-top:30px}
 
 @media (max-width:1400px){
   .metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:24px 28px}
@@ -327,11 +328,15 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
     <section class="view" id="v-accounts" hidden>
       <div id="pool-off" class="empty" hidden></div>
 
+      <!-- 摘要指标放在闸门之前：这些数字 /overview 里本来就有，不需要会话，
+           这样未登录时也不是一个空页面 -->
+      <div class="metrics" id="pool-metrics" hidden></div>
+
       <div id="pool-login" hidden>
         <h3>需要管理口令</h3>
         <p class="muted" style="margin:6px 0 14px">
-          口令是启动 console 时的环境变量 <span class="mono">CC_ADMIN_PASSWORD</span>。登录后可以：
-          <b>添加/删除账号</b>、解封、清冷却、看每个账号的<b>额度卡片</b>、改准入白名单。
+          口令是启动 console 时的环境变量 <span class="mono">CC_ADMIN_PASSWORD</span>（在你启动 console 的那个终端里）。
+          登录后可以：<b>添加/删除账号</b>、解封、清冷却、看每个账号的<b>额度卡片</b>、改准入白名单。
         </p>
         <form id="login-form" class="login">
           <input type="password" id="pw" class="form-in in-key" autocomplete="current-password" placeholder="管理口令" aria-label="管理口令">
@@ -341,8 +346,6 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
       </div>
 
       <div id="pool-panel" hidden>
-        <div class="metrics" id="pool-metrics"></div>
-
         <div class="sec-head" style="margin-top:28px">
           <h3 style="margin:0">账号</h3>
           <span class="muted small">优先级数字小的先用；同优先级内按权重加权随机</span>
@@ -689,8 +692,8 @@ async function admin(path, init = {}) {
 function renderAccounts(d) {
   const pool = d?.pool || { enabled: false };
   $('nav-accounts').textContent = pool.enabled && pool.mode ? String(pool.mode.total) : '';
-  const off = $('pool-off'), login = $('pool-login'), panel = $('pool-panel');
-  off.hidden = login.hidden = panel.hidden = true;
+  const off = $('pool-off'), login = $('pool-login'), panel = $('pool-panel'), met = $('pool-metrics');
+  off.hidden = login.hidden = panel.hidden = met.hidden = true;
 
   if (!pool.enabled) {
     off.hidden = false;
@@ -698,29 +701,37 @@ function renderAccounts(d) {
       + '池会接管上游 key 的选择，额度耗尽自动换号，凭据被拒自动封禁。';
     return;
   }
-  if (!acctAuthed) { login.hidden = false; return; }
-  panel.hidden = false;
-  loadAccounts().catch((e) => { $('login-msg').textContent = e.message; });
-}
 
-async function loadAccounts() {
-  const data = await admin('/accounts');
-  const av = data.availability;
-
-  // 概览
-  const m = $('pool-metrics'); clear(m);
+  // 摘要指标不需要会话（overview 里本来就有），未登录时也先给人看
+  const av = pool.mode || {};
+  met.hidden = false;
+  clear(met);
   const cell = (k, v, cls) => {
     const b = el('div');
     b.appendChild(el('div', 'k', k));
     b.appendChild(el('div', 'v' + (cls ? ' ' + cls : ''), v));
     return b;
   };
-  m.appendChild(cell('可用', String(av.usable), av.usable ? 'ok-state' : 'bad-state'));
-  m.appendChild(cell('冷却中', String(av.cooling), av.cooling ? 'warn-state' : ''));
-  m.appendChild(cell('已封禁', String(av.banned), av.banned ? 'bad-state' : ''));
-  m.appendChild(cell('已停用', String(av.disabled)));
-  m.appendChild(cell('总计', String(av.total)));
-  m.appendChild(cell('重试上限', String(data.retryMax ?? lastData?.pool?.retryMax ?? 2) + ' 次'));
+  met.appendChild(cell('可用', String(av.usable ?? 0), av.usable ? 'ok-state' : 'bad-state'));
+  met.appendChild(cell('冷却中', String(av.cooling ?? 0), av.cooling ? 'warn-state' : ''));
+  met.appendChild(cell('已封禁', String(av.banned ?? 0), av.banned ? 'bad-state' : ''));
+  met.appendChild(cell('已停用', String(av.disabled ?? 0)));
+  met.appendChild(cell('总计', String(av.total ?? 0)));
+  met.appendChild(cell('重试上限', String(pool.retryMax ?? 2) + ' 次'));
+
+  if (!acctAuthed) {
+    login.hidden = false;
+    $('login-msg').textContent = av.total
+      ? `池里有 ${av.total} 个账号（可用 ${av.usable}）。输入口令后可以看到每个账号的额度卡片并增删改。`
+      : '池里还没有账号。输入口令后即可添加第一个。';
+    return;
+  }
+  panel.hidden = false;
+  loadAccounts().catch((e) => { $('login-msg').textContent = e.message; });
+}
+
+async function loadAccounts() {
+  const data = await admin('/accounts');
 
   // 准入
   for (const r of document.querySelectorAll('input[name=accmode]')) r.checked = r.value === data.accessMode;
