@@ -5,9 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Command Code Proxy · 控制台</title>
 <!--
-  极简运维控制台（只读）。手写单文件设计系统，零运行时依赖、零构建（HANDOFF-webui.md D2/R4）。
+  极简运维控制台。手写单文件设计系统，零运行时依赖、零构建（HANDOFF-webui.md D2/R4）。
+  设了 CC_ADMIN_PASSWORD 就有管理口（账号池 / 准入 / 审计），否则退回"仅本机只读"。
 
-  设计读向：单人自用的本地只读控制台，冷静极简，单色为主 + 只有语义状态色。
+  设计读向：单人自用的本机控制台，冷静极简，单色为主 + 只有语义状态色。
   刻度：DESIGN_VARIANCE 5 / MOTION_INTENSITY 3 / VISUAL_DENSITY 3。
 
   刻意遵守的约束（design-taste-frontend）：
@@ -218,7 +219,26 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
 .acct-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
 .sec-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
 .sec-head .small{font-size:12px}
-#pool-login{margin-top:30px}
+
+/* ── 全局闸门：没登录就只有这一块，导航与刷新控件一并收起来 ───── */
+/* 闸门在内容区里竖直居中：登录页只有一屏内容，顶在左上角会显得像没加载完 */
+body.locked main{display:flex;flex-direction:column;justify-content:center;min-height:100dvh;padding-top:0;padding-bottom:0}
+body.locked #gate{width:100%}
+#gate{max-width:1120px}
+#gate h1{margin:6px 0 10px}
+#gate .lede{max-width:620px}
+#gate .login{margin-top:18px}
+#gate-meta{margin-top:14px;max-width:460px}
+.gate-grid{display:grid;grid-template-columns:minmax(0,520px) minmax(0,1fr);gap:20px 64px;align-items:start;margin-top:22px}
+.gate-list{border-top:1px solid var(--line)}
+.gate-list .k{font-size:12px;color:var(--muted);padding:9px 0 4px}
+.gate-list .g{display:flex;gap:18px;padding:9px 0;border-bottom:1px solid var(--line);font-size:14px}
+.gate-list .g b{width:88px;flex:none;font-weight:400;color:var(--ink)}
+.gate-list .g span{color:var(--muted);min-width:0}
+body.locked .nav,
+body.locked .rail-foot .row,
+body.locked #chip-poll{display:none}
+body.locked .rail-foot{margin-top:auto}
 
 @media (max-width:1400px){
   .metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:24px 28px}
@@ -235,6 +255,7 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
   .rail-foot{margin-top:16px;padding-top:14px}
   .col{border-left:0}
   main{padding:32px 20px 72px;max-width:none}
+  .gate-grid{grid-template-columns:1fr;gap:24px}
 }
 @media (max-width:680px){
   .split{grid-template-columns:1fr;gap:26px}
@@ -248,7 +269,7 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
 
 <div class="shell">
   <aside class="rail">
-    <div class="brand">Command Code Proxy<small>只读 / 仅本机</small></div>
+    <div class="brand">Command Code Proxy<small>仅本机 / 管理台</small></div>
     <nav class="nav" aria-label="视图">
       <a href="#/status" data-view="status">运行状态</a>
       <a href="#/device" data-view="device">设备伪装<span class="nav-count" id="nav-device">-</span></a>
@@ -263,11 +284,42 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
         <button class="btn" id="btn-poll" type="button">暂停</button>
         <button class="btn primary" id="btn-now" type="button">刷新</button>
       </div>
+      <button class="btn" id="btn-logout" type="button" hidden style="width:100%;margin-top:8px">退出登录</button>
     </div>
   </aside>
 
   <div class="col">
   <main>
+    <!-- 全局鉴权闸门：设了 CC_ADMIN_PASSWORD 时，未登录只显示这一块，所有视图都藏起来 -->
+    <section id="gate" hidden>
+      <span class="eyebrow">Command Code Proxy · Console</span>
+      <h1>需要管理口令</h1>
+      <p class="muted lede">
+        口令是启动 console 时的环境变量 <span class="mono">CC_ADMIN_PASSWORD</span>（在你启动 console 的那个终端里）。
+        控制台的<b>全部</b>数据与操作都在它后面，读和写共用同一道闸门。
+      </p>
+      <div class="gate-grid">
+        <div>
+          <form id="login-form" class="login">
+            <input type="password" id="pw" class="form-in in-key" autocomplete="current-password" placeholder="管理口令" aria-label="管理口令">
+            <button class="btn primary" type="submit">登录</button>
+          </form>
+          <p class="muted" id="login-msg"></p>
+          <p class="muted" id="gate-meta"></p>
+        </div>
+        <div class="gate-list">
+          <div class="k">登录后可见</div>
+          <div class="g"><b>运行状态</b><span>在途请求、状态码分布、端点耗时</span></div>
+          <div class="g"><b>设备伪装</b><span>每个 key 的指纹与下次上报</span></div>
+          <div class="g"><b>上游错误</b><span>真实错误码、类型与摘要，分页查看</span></div>
+          <div class="g"><b>模型</b><span>当前暴露给客户端的模型清单</span></div>
+          <div class="g"><b>账号</b><span>额度卡片、增删账号、解封、准入白名单</span></div>
+          <div class="g"><b>配置</b><span>脱敏后的运行配置</span></div>
+        </div>
+      </div>
+    </section>
+
+    <div id="app">
     <div class="banner" id="banner" hidden role="status"></div>
 
     <div class="head">
@@ -328,24 +380,10 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
     <section class="view" id="v-accounts" hidden>
       <div id="pool-off" class="empty" hidden></div>
 
-      <!-- 摘要指标放在闸门之前：这些数字 /overview 里本来就有，不需要会话，
-           这样未登录时也不是一个空页面 -->
       <div class="metrics" id="pool-metrics" hidden></div>
 
-      <div id="pool-login" hidden>
-        <h3>需要管理口令</h3>
-        <p class="muted" style="margin:6px 0 14px">
-          口令是启动 console 时的环境变量 <span class="mono">CC_ADMIN_PASSWORD</span>（在你启动 console 的那个终端里）。
-          登录后可以：<b>添加/删除账号</b>、解封、清冷却、看每个账号的<b>额度卡片</b>、改准入白名单。
-        </p>
-        <form id="login-form" class="login">
-          <input type="password" id="pw" class="form-in in-key" autocomplete="current-password" placeholder="管理口令" aria-label="管理口令">
-          <button class="btn primary" type="submit">登录</button>
-        </form>
-        <p class="muted" id="login-msg" style="margin-top:10px"></p>
-      </div>
-
       <div id="pool-panel" hidden>
+        <p class="muted" id="acct-msg" style="margin-top:14px"></p>
         <div class="sec-head" style="margin-top:28px">
           <h3 style="margin:0">账号</h3>
           <span class="muted small">优先级数字小的先用；同优先级内按权重加权随机</span>
@@ -382,7 +420,8 @@ footer{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);font-si
       <div class="kv" id="config-rows"><span class="sk w60"></span></div>
     </section>
 
-    <footer>只读。密钥字段只显示前缀与摘要，不显示明文。</footer>
+    <footer>写操作都要管理口令。密钥字段只显示前缀与摘要，不显示明文。</footer>
+    </div>
   </main>
   </div>
 </div>
@@ -674,26 +713,27 @@ function renderActive() {
 }
 
 // ── 账号视图 ───────────────────────────────────────────────
-let acctAuthed = false;
-
-/** 管理 API 的统一入口：401 就退回登录态 */
+/** 管理 API 的统一入口：会话失效就整页退回闸门（不再有"半登录"状态） */
 async function admin(path, init = {}) {
   const res = await fetch('/api/console' + path, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
   });
-  if (res.status === 401) { acctAuthed = false; renderAccounts(lastData); throw new Error('unauthorized'); }
+  if (res.status === 401) { setLocked(true, '会话已失效，请重新输入口令。'); throw new Error('unauthorized'); }
   let data = null;
   try { data = await res.json(); } catch {}
   if (!res.ok) throw new Error(data?.message || data?.error || ('HTTP ' + res.status));
   return data;
 }
 
+/** 账号视图里的操作反馈。登录后闸门是藏起来的，所以不能再往 #login-msg 里写 */
+function acctMsg(text) { $('acct-msg').textContent = text || ''; }
+
 function renderAccounts(d) {
   const pool = d?.pool || { enabled: false };
   $('nav-accounts').textContent = pool.enabled && pool.mode ? String(pool.mode.total) : '';
-  const off = $('pool-off'), login = $('pool-login'), panel = $('pool-panel'), met = $('pool-metrics');
-  off.hidden = login.hidden = panel.hidden = met.hidden = true;
+  const off = $('pool-off'), panel = $('pool-panel'), met = $('pool-metrics');
+  off.hidden = panel.hidden = met.hidden = true;
 
   if (!pool.enabled) {
     off.hidden = false;
@@ -719,15 +759,9 @@ function renderAccounts(d) {
   met.appendChild(cell('总计', String(av.total ?? 0)));
   met.appendChild(cell('重试上限', String(pool.retryMax ?? 2) + ' 次'));
 
-  if (!acctAuthed) {
-    login.hidden = false;
-    $('login-msg').textContent = av.total
-      ? `池里有 ${av.total} 个账号（可用 ${av.usable}）。输入口令后可以看到每个账号的额度卡片并增删改。`
-      : '池里还没有账号。输入口令后即可添加第一个。';
-    return;
-  }
+  // 走到这里就一定已经过了全局闸门，直接渲染账号面板
   panel.hidden = false;
-  loadAccounts().catch((e) => { $('login-msg').textContent = e.message; });
+  loadAccounts().catch((e) => acctMsg(e.message));
 }
 
 async function loadAccounts() {
@@ -818,7 +852,7 @@ async function loadAccounts() {
       const b = el('button', 'btn' + (cls ? ' ' + cls : ''), label);
       b.type = 'button';
       b.addEventListener('click', async () => {
-        try { await fn(); } catch (e) { if (!e?.silent) $('login-msg').textContent = e.message; }
+        try { await fn(); } catch (e) { if (!e?.silent) acctMsg(e.message); }
         await loadAccounts();
       });
       acts.appendChild(b);
@@ -828,7 +862,7 @@ async function loadAccounts() {
     mk('查额度', () => admin(`/accounts/${a.keyHash}/quota`, { method: 'POST' }));
     mk('测连通', async () => {
       const r = await admin(`/accounts/${a.keyHash}/test`, { method: 'POST' });
-      $('login-msg').textContent = r.ok ? `连通正常（org ${r.whoami?.orgId ?? DASH}）` : `连通失败：${r.error}`;
+      acctMsg(r.ok ? `连通正常（org ${r.whoami?.orgId ?? DASH}）` : `连通失败：${r.error}`);
       throw Object.assign(new Error(''), { silent: true });
     });
     mk(a.enabled ? '停用' : '启用', () => admin(`/accounts/${a.keyHash}`, { method: 'PATCH', body: JSON.stringify({ enabled: !a.enabled }) }));
@@ -852,9 +886,57 @@ async function loadAccounts() {
   }
 }
 
+// ── 全局闸门：登录 / 退出 ──────────────────────────────────
+// 一个口令管住整站。未登录时只渲染 #gate，导航、刷新控件、所有视图全藏起来；
+// 登录成功后同一套轮询照常跑，退出即回到闸门。
+// 没设 CC_ADMIN_PASSWORD 时池是关的：没有口令可验，也就没有"退出登录"这回事。
+let poolOn = false;
+
+function setLocked(on, msg) {
+  const gate = $('gate'), app = $('app');
+  if (gate) gate.hidden = !on;
+  if (app) app.hidden = on;
+  document.body.classList.toggle('locked', !!on);
+  $('btn-logout').hidden = !!on || !poolOn;
+  if (msg != null) $('login-msg').textContent = msg;
+  if (on) {
+    stop();
+    window.scrollTo(0, 0);
+    $('pw').focus();
+  } else {
+    $('login-msg').textContent = '';
+    $('pw').value = '';
+  }
+}
+
+function gateMeta(probe) {
+  const m = $('gate-meta');
+  if (!probe || !probe.pool) { m.textContent = ''; return; }
+  m.textContent = probe.total
+    ? `池里有 ${probe.total} 个账号，当前可用 ${probe.usable} 个。`
+    : '池里还没有账号。登录后粘一个上游 key（user_…）就能开始用。';
+}
+
+/** 进站先问一句：需不需要口令、当前会话还有效吗 */
+async function probeGate() {
+  try {
+    const res = await fetch('/api/console/gate', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const probe = await res.json();
+    poolOn = !!probe.pool;
+    gateMeta(probe);
+    return probe.authed !== false;
+  } catch (e) {
+    // 探针本身失败（例如代理没起来）：不把人锁在门外，让主轮询去报错
+    return true;
+  }
+}
+
 $('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   $('login-msg').textContent = '';
+  const btn = $('login-form').querySelector('button');
+  if (btn) btn.disabled = true;
   try {
     const res = await fetch('/api/console/auth', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -862,10 +944,21 @@ $('login-form').addEventListener('submit', async (e) => {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) { $('login-msg').textContent = data.message || '登录失败'; return; }
-    acctAuthed = true;
-    $('pw').value = '';
-    renderAccounts(lastData);
-  } catch (err) { $('login-msg').textContent = err.message; }
+    setLocked(false);
+    await tick();
+    start();
+  } catch (err) {
+    $('login-msg').textContent = err.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+});
+
+$('btn-logout').addEventListener('click', async () => {
+  try { await fetch('/api/console/auth', { method: 'DELETE' }); } catch {}
+  lastData = null;
+  acctMsg('');
+  setLocked(true, '已退出登录。');
 });
 
 $('add-form').addEventListener('submit', async (e) => {
@@ -889,15 +982,15 @@ $('btn-add-client').addEventListener('click', async () => {
   try {
     const r = await admin('/access', { method: 'POST', body: JSON.stringify({ key, label: '' }) });
     $('new-client').value = '';
-    $('login-msg').textContent = `已加入白名单 ${r.hint}`;
+    acctMsg(`已加入白名单 ${r.hint}`);
     await loadAccounts();
-  } catch (e) { $('login-msg').textContent = e.message; }
+  } catch (e) { acctMsg(e.message); }
 });
 
 for (const r of document.querySelectorAll('input[name=accmode]')) {
   r.addEventListener('change', async () => {
     try { await admin('/access', { method: 'POST', body: JSON.stringify({ mode: r.value }) }); await loadAccounts(); }
-    catch (e) { $('login-msg').textContent = e.message; }
+    catch (e) { acctMsg(e.message); }
   });
 }
 
@@ -940,6 +1033,8 @@ async function tick() {
   let d;
   try {
     const res = await fetch('/api/console/overview', { cache: 'no-store' });
+    // 会话没了（或被别处退出）→ 整页回到闸门，别拿 401 当"连不上"报
+    if (res.status === 401) { setLocked(true, '会话已失效，请重新输入口令。'); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     d = await res.json();
   } catch (e) {
@@ -957,6 +1052,7 @@ async function tick() {
 
 // ── 轮询开关 ───────────────────────────────────────────────
 function start() {
+  if (document.body.classList.contains('locked')) return;   // 闸门后面没有可轮询的数据
   if (timer) return;
   live = true; $('btn-poll').textContent = '暂停';
   $('chip-poll').textContent = '自动刷新 ' + (POLL_MS / 1000) + 's';
@@ -974,7 +1070,15 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) stop(
 
 if (!location.hash) history.replaceState(null, '', '#/status');
 route();
-tick(); start();
+
+// 启动顺序：先问闸门（决定渲不渲主界面），再开始轮询
+(async () => {
+  const open = await probeGate();
+  if (!open) { $('app').hidden = true; setLocked(true); return; }
+  setLocked(false);
+  await tick();
+  start();
+})();
 </script>
 </body>
 </html>

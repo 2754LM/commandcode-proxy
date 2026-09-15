@@ -172,10 +172,26 @@ function poolStatus() {
   };
 }
 
-function requireSession(req, res) {
-  if (!POOL) { sendJSON(res, 501, { error: 'pool_disabled', message: '设置 CC_ADMIN_PASSWORD 后才会启用账号池' }); return false; }
+/**
+ * 统一鉴权闸门（全局）。
+ *   设了 CC_ADMIN_PASSWORD  → 整个 /api/console/* 都要管理会话（只有登录端点本身公开）
+ *   没设                    → 没有口令可验，退回「仅回环只读」的旧语义：核心只读口放行、其余 501
+ * 之前是「读口公开、写口要口令」，那等于把 /overview（含每个 key 的设备指纹）、
+ * /config、/errors 全裸在回环上，且两套心智模型；现在统一。
+ */
+const CORE_READ_PATHS = new Set(['/overview', '/device', '/stats', '/errors', '/config', '/models', '/health']
+  .map((s) => API_PREFIX + s));
+
+function requireSession(req, res, p = '') {
+  const read = req.method === 'GET' || req.method === 'HEAD';
+  if (!POOL) {
+    // 没启用池：核心自己的只读路由照旧放行（仅回环），账号池相关的口一律 501（它们本来也不存在）
+    if (read && CORE_READ_PATHS.has(p)) return true;
+    sendJSON(res, 501, { error: 'pool_disabled', message: '设置 CC_ADMIN_PASSWORD 后才会启用账号池与写口' });
+    return false;
+  }
   if (!POOL.auth.check(POOL.auth.tokenOf(req))) {
-    sendJSON(res, 401, { error: 'unauthorized', message: '需要管理会话：先 POST /api/console/auth' });
+    sendJSON(res, 401, { error: 'unauthorized', message: '控制台需要管理口令：先 POST /api/console/auth' });
     return false;
   }
   return true;
@@ -243,7 +259,7 @@ async function handleAdmin(req, res, url) {
   }
 
   // 读类：列表/审计/准入（也要会话 —— 账号列表属于敏感信息）
-  if (!requireSession(req, res)) return;
+  if (!requireSession(req, res, p)) return;
 
   const hashOf = (prefix) => {
     const seg = p.slice(prefix.length).split('/').filter(Boolean);
@@ -352,6 +368,15 @@ async function handleAdmin(req, res, url) {
     const rows = POOL.db.prepare('SELECT at, action, target, outcome, ip FROM audit ORDER BY id DESC LIMIT ?').all(limit);
     return sendJSON(res, 200, { rows });
   }
+
+  // ── 只读数据接口（也在会话闸门之后：/overview 里有每个 key 的设备指纹，不是公开信息）──
+  if (p === API_PREFIX + '/overview' && m === 'GET') return sendJSON(res, 200, buildOverview());
+  if (p === API_PREFIX + '/device' && m === 'GET') return sendJSON(res, 200, buildDevice());
+  if (p === API_PREFIX + '/stats' && m === 'GET') return sendJSON(res, 200, stats.snapshot());
+  if (p === API_PREFIX + '/errors' && m === 'GET') return sendJSON(res, 200, stats.snapshot().errors);
+  if (p === API_PREFIX + '/config' && m === 'GET') return sendJSON(res, 200, redactConfig(CFG));
+  if (p === API_PREFIX + '/models' && m === 'GET') return sendJSON(res, 200, { models: MODELS.map(x => ({ id: x.id, name: x.name || null })) });
+  if (p === API_PREFIX + '/health' && m === 'GET') return sendJSON(res, 200, { ok: true, at: Date.now() });
 
   return sendJSON(res, 404, { error: 'not_found', path: p });
 }
@@ -558,37 +583,45 @@ async function handleConsole(req, res, url) {
   }
 
   const p = url.pathname;
-  const write = req.method !== 'GET' && req.method !== 'HEAD';
+  const isApi = p === API_PREFIX || p.startsWith(API_PREFIX + '/');
 
-  // 写口：只开放 /api/console/* 的管理路由，并且一律要管理会话。
-  // 其余路径维持"只读"（原 Q1 约束），避免核心的写路径被意外触达。
-  if (write) {
-    if (p.startsWith(API_PREFIX)) return handleAdmin(req, res, url);
+  // 非 API 路径：只服务 UI 静态外壳。
+  // 外壳本身不含任何数据（数据全靠 /api/console/* 取），所以公开 —— 否则连登录框都渲染不出来。
+  if (!isApi) {
+    if (p === UI_PATH || p === UI_PATH + '/' || p === UI_PATH + '/index.html') {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8', Allow: 'GET, HEAD', ...SECURITY_HEADERS });
+        res.end(JSON.stringify({ error: 'read_only', message: 'Console shell is read-only.' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
+      res.end(UI_HTML);
+      return;
+    }
+    // 其它路径一律 405/404 —— 绝不落到核心的写路径上
     res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8', Allow: 'GET, HEAD', ...SECURITY_HEADERS });
-    res.end(JSON.stringify({ error: 'read_only', message: 'Console is read-only except /api/console admin routes.' }));
+    res.end(JSON.stringify({ error: 'read_only', message: 'Only GET/HEAD on /console, and /api/console/*.' }));
     return;
   }
 
-  if (p === UI_PATH || p === UI_PATH + '/' || p === UI_PATH + '/index.html') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
-    res.end(UI_HTML);
-    return;
+  // 登录端点本身公开（否则没法换取会话）
+  if (p === API_PREFIX + '/auth' && req.method === 'POST') return handleAdmin(req, res, url);
+
+  // 闸门探针：只回答"要不要口令、当前会话还行不行、池里有几个账号"。
+  // 不含任何 key / 指纹 / 配置 —— 目的是让登录页本身不是一片空白，同时不泄漏池内明细。
+  if (p === API_PREFIX + '/gate' && req.method === 'GET') {
+    const a = POOL ? POOL.pool.availability() : null;
+    return sendJSON(res, 200, {
+      pool: !!POOL,
+      authed: POOL ? POOL.auth.check(POOL.auth.tokenOf(req)) : true,
+      total: a ? a.total : 0,
+      usable: a ? a.usable : 0,
+    }, { 'Cache-Control': 'no-store' });
   }
 
-  // GET 的管理路由也走 handleAdmin（账号列表属于敏感信息，同样要会话）
-  if (p === API_PREFIX + '/accounts' || p === API_PREFIX + '/access' || p === API_PREFIX + '/audit') {
-    return handleAdmin(req, res, url);
-  }
-
-  if (p === API_PREFIX + '/overview') return sendJSON(res, 200, buildOverview());
-  if (p === API_PREFIX + '/device') return sendJSON(res, 200, buildDevice());
-  if (p === API_PREFIX + '/stats') return sendJSON(res, 200, stats.snapshot());
-  if (p === API_PREFIX + '/errors') return sendJSON(res, 200, stats.snapshot().errors);
-  if (p === API_PREFIX + '/config') return sendJSON(res, 200, redactConfig(CFG));
-  if (p === API_PREFIX + '/models') return sendJSON(res, 200, { models: MODELS.map(m => ({ id: m.id, name: m.name || null })) });
-  if (p === API_PREFIX + '/health') return sendJSON(res, 200, { ok: true, at: Date.now() });
-
-  sendJSON(res, 404, { error: 'not_found', path: p });
+  // ← 全局鉴权闸门：以下**全部** /api/console/*（读与写）都要会话
+  if (!requireSession(req, res, p)) return;
+  return handleAdmin(req, res, url);
 }
 
 // ── 接管 request 事件 ────────────────────────────────
