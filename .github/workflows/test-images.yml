@@ -57,6 +57,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # GHCR 要求仓库名全小写，而 github.repository 会保留大小写（MAXeaglet/...）。
+      # 发布线那条用的是 metadata-action（它会自动转小写），这里手写标签就必须自己转，
+      # 否则 buildx 直接报 "repository name must be lowercase"。
+      - name: Resolve lowercase image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -64,7 +71,7 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ matrix.tag }}
+          tags: ${{ steps.img.outputs.name }}:${{ matrix.tag }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -77,6 +84,6 @@ jobs:
             echo "### ${{ matrix.name }}"
             echo ""
             echo "- Dockerfile: \`${{ matrix.dockerfile }}\`"
-            echo "- Image: \`ghcr.io/${{ github.repository }}:${{ matrix.tag }}\`"
+            echo "- Image: \`${{ steps.img.outputs.name }}:${{ matrix.tag }}\`"
             echo "- Commit: \`${{ github.sha }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
