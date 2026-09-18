@@ -1137,12 +1137,25 @@ function getApiKey(headers) {
 const UPSTREAM_PROXY = CFG.upstreamProxy || '';
 const PROXY_CONNECT_TIMEOUT_MS = 15000;
 
+// 代理 URL 可能带 user:pass —— 任何日志/错误消息都只允许出现 host:port。
+// （README 承诺「隐私保护日志」，把口令打进启动横幅是直接违反。）
+function redactProxyUrl(raw) {
+  if (!raw) return '(direct)';
+  try {
+    const u = new URL(raw);
+    return `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}`;
+  } catch {
+    return '(invalid upstreamProxy)';
+  }
+}
+
 function parseProxyUrl(raw) {
   let u;
   try {
     u = new URL(raw);
   } catch {
-    throw new Error(`upstreamProxy is not a valid URL: ${raw}`);
+    // 不回显原串：里面可能就是口令
+    throw new Error('upstreamProxy is not a valid URL (expected http://host:port)');
   }
   if (u.protocol !== 'http:') {
     throw new Error(`upstreamProxy only supports http:// (CONNECT) proxies, got ${u.protocol}//`);
@@ -1151,6 +1164,21 @@ function parseProxyUrl(raw) {
     ? 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')
     : null;
   return { host: u.hostname, port: Number.parseInt(u.port || '80', 10), auth };
+}
+
+// 启动即校验：写错的代理地址应当立刻拒绝启动，而不是每个请求各 502 一次。
+if (UPSTREAM_PROXY) {
+  try {
+    parseProxyUrl(UPSTREAM_PROXY);
+  } catch (e) {
+    log('error', 'Invalid upstreamProxy, refusing to start', {
+      error: e.message, value: redactProxyUrl(UPSTREAM_PROXY),
+    });
+    process.exit(1);
+  }
+  log('info', 'Upstream requests will go through the configured proxy', {
+    proxy: redactProxyUrl(UPSTREAM_PROXY),
+  });
 }
 
 /** Response 的 headers 需要字符串值；node 的 set-cookie 是数组，展开为多行。 */
@@ -1219,7 +1247,11 @@ async function proxyFetch(urlStr, options = {}) {
       headers: options.headers || {},
       createConnection: () => socket,
     }, (res) => {
-      resolve(new Response(Readable.toWeb(res), {
+      // 204/205/304 按规范不允许带 body，Response 构造器会直接抛 —— 这两个状态必须传 null，
+      // 同时把连接排空，避免隧道 socket 悬着。
+      const nullBodyStatus = res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304;
+      if (nullBodyStatus) { try { res.resume(); } catch {} }
+      resolve(new Response(nullBodyStatus ? null : Readable.toWeb(res), {
         status: res.statusCode,
         statusText: res.statusMessage,
         headers: headersToInit(res.headers),
@@ -3437,7 +3469,7 @@ server.listen(CFG.port, CFG.host, () => {
     keepAliveTimeout: `${KEEPALIVE_TIMEOUT_MS}ms (反代侧 keepalive_timeout 必须小于它)`,
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
-    upstreamProxy: UPSTREAM_PROXY || '(direct)',
+    upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
