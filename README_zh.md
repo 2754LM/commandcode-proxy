@@ -2,6 +2,11 @@
 
 > [English Docs](README.md)
 
+> **上游原项目**：[MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)
+>
+> 本仓库基于该项目，代理内核与协议实现均来自上游，遵循其 MIT License（版权归原作者 MAXeaglet 所有）。
+> 本仓库在上游之上额外增加了：**多 Key 池与负载均衡 · Web 管理台 · 会话级调度与失败转移 · 额度轮询与自动停用 · Docker 数据持久化**。
+
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
 
 基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。

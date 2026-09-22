@@ -2,6 +2,11 @@
 
 > [中文文档](README_zh.md)
 
+> **Original upstream project**: [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)
+>
+> This repository is based on it — the proxy core and protocol implementation come from upstream, under its MIT License (copyright (c) 2026 MAXeaglet).
+> On top of upstream this repository adds: **multi-key pool with load balancing · web admin console · session-level routing with failover · credit polling with auto-disable · Docker data persistence**.
+
 A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
