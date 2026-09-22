@@ -1,0 +1,496 @@
+<!-- AI生成 -->
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#08090e" />
+  <title>Command Code Proxy · Key 池管理</title>
+  <link rel="stylesheet" href="./admin.css" />
+</head>
+<body>
+
+  <!-- ── 图标精灵（避免额外网络请求） ─────────────────────────── -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.1M12 19.3v2.1M2.6 12h2.1M19.3 12h2.1M5.4 5.4l1.5 1.5M17.1 17.1l1.5 1.5M5.4 18.6l1.5-1.5M17.1 6.9l1.5-1.5"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.6 13.3A8.6 8.6 0 1 1 10.7 3.4a6.9 6.9 0 0 0 9.9 9.9Z"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.9 12.1 20.5 2.5"/><path d="m17 6 1.8 1.8"/></symbol>
+    <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8.4 12.3 2.4 2.4 4.8-5.2"/></symbol>
+    <symbol id="i-credits" viewBox="0 0 24 24"><ellipse cx="12" cy="5.6" rx="7.4" ry="3"/><path d="M4.6 5.6v12.8c0 1.7 3.3 3 7.4 3s7.4-1.3 7.4-3V5.6"/><path d="M4.6 12c0 1.7 3.3 3 7.4 3s7.4-1.3 7.4-3"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5.6" r="2.8"/><circle cx="6" cy="12" r="2.8"/><circle cx="18" cy="18.4" r="2.8"/><path d="m8.5 10.6 7-3.6M8.5 13.4l7 3.6"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 3.6l2.7 5.5 6 .9-4.3 4.2 1 6-5.4-2.9-5.4 2.9 1-6L3.3 10l6-.9Z"/></symbol>
+    <symbol id="i-star-fill" viewBox="0 0 24 24"><path d="M12 3.6l2.7 5.5 6 .9-4.3 4.2 1 6-5.4-2.9-5.4 2.9 1-6L3.3 10l6-.9Z" fill="currentColor"/></symbol>
+    <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M12 20.5h9"/><path d="M16.6 3.6a2.1 2.1 0 0 1 3 3L7.2 19l-4.2 1.1L4.1 16Z"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3.6 6.6h16.8"/><path d="M9.2 6.6V4.4h5.6v2.2"/><path d="M6.2 6.6 7.2 20.6h9.6l1-14"/><path d="M10.4 10.4v6.2M13.6 10.4v6.2"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11.4" height="11.4" rx="2.4"/><path d="M5.6 15A2.6 2.6 0 0 1 3 12.4V5.6A2.6 2.6 0 0 1 5.6 3h6.8A2.6 2.6 0 0 1 15 5.6"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 6.8v5.4l3.4 2"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.3 21 19.7H3Z"/><path d="M12 9.6v4.3"/><path d="M12 17.1h.01"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.2 6.2 17.8 17.8M17.8 6.2 6.2 17.8"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7.2h9.4M18.4 7.2H20M4 16.8h4.6M13.6 16.8H20"/><circle cx="16" cy="7.2" r="2.3"/><circle cx="11.2" cy="16.8" r="2.3"/></symbol>
+    <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M3.4 13h4.2l1.5 3h5.8l1.5-3h4.2"/><path d="M6.3 4.4h11.4l3.3 8.6v6.8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6.8Z"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 21.6s7.6-3.7 7.6-9.4V5.6L12 2.6 4.4 5.6v6.6c0 5.7 7.6 9.4 7.6 9.4Z"/><path d="m9.2 11.9 2 2 3.7-3.9"/></symbol>
+  </svg>
+
+  <!-- ── 顶栏 ───────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="./admin">
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-key"/></svg>
+        </span>
+        <span class="brand-text">
+          <strong>Command Code Proxy</strong>
+          <small>Key 池管理台</small>
+        </span>
+      </a>
+
+      <div class="topbar-actions">
+        <span class="chip upstream" title="上游 API 地址">
+          <i class="dot" aria-hidden="true"></i>
+          <code id="apiBase">api</code>
+        </span>
+        <button id="btnReload" class="btn ghost" type="button" title="重新加载数据">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-refresh"/></svg>
+          <span class="btn-label">刷新</span>
+        </button>
+        <button id="btnAdd" class="btn primary" type="button">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"/></svg>
+          <span class="btn-label">添加 Key</span>
+        </button>
+        <button id="btnTheme" class="icon-btn" type="button" title="切换明暗主题" aria-label="切换明暗主题">
+          <svg class="ic ic-sun" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sun"/></svg>
+          <svg class="ic ic-moon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-moon"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <div class="page">
+
+    <!-- ── 概览（所有标签页共用） ───────────────────────────── -->
+    <section class="hero">
+      <div class="hero-head">
+        <div>
+          <h1>Key 池管理</h1>
+          <p class="lede">多 Key 负载均衡 · 额度查询 · 灵活调度</p>
+        </div>
+        <span class="hero-badge tone-idle" id="poolBadge">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-shield"/></svg>
+          <span id="poolBadgeText">正在加载…</span>
+        </span>
+      </div>
+
+      <div class="kpis">
+        <article class="kpi">
+          <span class="kpi-icon tone-violet" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-key"/></svg></span>
+          <div class="kpi-body">
+            <span class="kpi-label">Key 总数</span>
+            <strong id="statTotal">—</strong>
+            <span class="kpi-sub" id="statTotalSub">池内全部凭证</span>
+          </div>
+        </article>
+        <article class="kpi">
+          <span class="kpi-icon tone-green" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-check-circle"/></svg></span>
+          <div class="kpi-body">
+            <span class="kpi-label">可用 Key</span>
+            <strong id="statUsable">—</strong>
+            <span class="kpi-sub" id="statUsableSub">参与请求分发</span>
+          </div>
+        </article>
+        <article class="kpi">
+          <span class="kpi-icon tone-cyan" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-credits"/></svg></span>
+          <div class="kpi-body">
+            <span class="kpi-label">剩余额度合计</span>
+            <strong id="statCredits">—</strong>
+            <span class="kpi-sub" id="statCreditsSub">尚未查询额度</span>
+          </div>
+        </article>
+        <article class="kpi">
+          <span class="kpi-icon tone-amber" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-sliders"/></svg></span>
+          <div class="kpi-body">
+            <span class="kpi-label">活跃会话</span>
+            <strong id="statSessions">—</strong>
+            <span class="kpi-sub" id="statSessionsSub">—</span>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ── 标签页导航 ───────────────────────────────────────── -->
+    <nav class="tabs" id="tabs" role="tablist" aria-label="管理分区">
+      <button class="tab is-active" type="button" role="tab" data-tab="keys"
+        id="tabBtnKeys" aria-selected="true" aria-controls="panel-keys">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-key"/></svg>
+        <span>Key 池</span>
+        <b class="tab-count" id="tabKeysCount">0</b>
+      </button>
+      <button class="tab" type="button" role="tab" data-tab="routing"
+        id="tabBtnRouting" aria-selected="false" aria-controls="panel-routing" tabindex="-1">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sliders"/></svg>
+        <span>调度与轮询</span>
+        <i class="tab-dot" id="tabRouteDot" hidden aria-hidden="true"></i>
+      </button>
+      <button class="tab" type="button" role="tab" data-tab="sessions"
+        id="tabBtnSessions" aria-selected="false" aria-controls="panel-sessions" tabindex="-1">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-share"/></svg>
+        <span>会话</span>
+        <b class="tab-count" id="tabSessionsCount">0</b>
+      </button>
+    </nav>
+
+    <main class="main">
+
+      <!-- ══ 标签页 1：Key 池 ══════════════════════════════════ -->
+      <section class="tab-panel is-active" id="panel-keys" data-panel="keys" role="tabpanel" aria-labelledby="tabBtnKeys">
+        <div class="layout">
+          <div class="col-main">
+            <section class="panel keys-panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-key"/></svg></span>
+                  <div>
+                    <h2>Key 池</h2>
+                    <p class="hint">只使用池内 Key，请求头里的 Key 会被忽略。可设默认 Key、快捷启停。</p>
+                  </div>
+                </div>
+                <div class="panel-tools">
+                  <button id="btnRefreshCredits" class="btn ghost sm" type="button">
+                    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-refresh"/></svg>
+                    <span class="btn-label">刷新全部额度</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="toolbar">
+                <div class="search">
+                  <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search"/></svg>
+                  <input id="keySearch" type="search" placeholder="搜索标签 / Key / ID…" autocomplete="off" spellcheck="false" aria-label="搜索 Key" />
+                  <kbd class="search-kbd" title="快捷键">Ctrl K</kbd>
+                  <button id="btnClearSearch" class="search-clear hidden" type="button" aria-label="清空搜索">
+                    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-x"/></svg>
+                  </button>
+                </div>
+
+                <div class="segmented" id="filterChips" role="group" aria-label="按状态过滤">
+                  <button class="seg is-active" type="button" data-filter="all">全部 <b>0</b></button>
+                  <button class="seg" type="button" data-filter="usable">可用 <b>0</b></button>
+                  <button class="seg" type="button" data-filter="exhausted">用尽 <b>0</b></button>
+                  <button class="seg" type="button" data-filter="cooling">冷却 <b>0</b></button>
+                </div>
+
+                <label class="select-wrap" title="排序方式">
+                  <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sliders"/></svg>
+                  <select id="keySort" aria-label="排序方式">
+                    <option value="default">默认顺序</option>
+                    <option value="credits-desc">剩余额度 高→低</option>
+                    <option value="usage-desc">窗口用量 高→低</option>
+                    <option value="weight-desc">权重 高→低</option>
+                    <option value="label-asc">标签 A→Z</option>
+                  </select>
+                </label>
+              </div>
+
+              <div id="keyList" class="key-list"></div>
+              <p id="emptyKeys" class="empty hidden">
+                <span class="empty-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-inbox"/></svg></span>
+                <b>还没有任何 Key</b>
+                <span>点击右上角「添加 Key」录入一个 <code>user_*</code> Key，即可开始分发请求。</span>
+                <button class="btn primary sm" type="button" data-act="add-key">
+                  <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"/></svg>
+                  <span class="btn-label">添加 Key</span>
+                </button>
+              </p>
+            </section>
+          </div>
+
+          <aside class="side">
+            <section class="panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-credits"/></svg></span>
+                  <div>
+                    <h2>额度明细</h2>
+                    <p class="hint">点击列表中某个 Key 的「额度」按钮查看详情。</p>
+                  </div>
+                </div>
+              </div>
+              <div id="creditsDetail" class="credits-detail">
+                <p class="empty sm">
+                  <span class="empty-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-credits"/></svg></span>
+                  <span>还没有选中 Key。</span>
+                </p>
+              </div>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ══ 标签页 2：调度与轮询 ══════════════════════════════ -->
+      <section class="tab-panel" id="panel-routing" data-panel="routing" role="tabpanel" aria-labelledby="tabBtnRouting" hidden>
+        <div class="grid-panels">
+          <section class="panel">
+            <div class="panel-head">
+              <div class="panel-title">
+                <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-share"/></svg></span>
+                <div>
+                  <h2>调度与容错</h2>
+                  <p class="hint">会话如何占用 Key，以及失败后怎么换。</p>
+                </div>
+              </div>
+            </div>
+            <form id="lbForm" class="form">
+              <div class="field">
+                <span class="field-label">分配模式</span>
+                <div class="segmented mode-seg" id="modeSwitch" role="group" aria-label="分配模式">
+                  <button type="button" class="seg is-active" data-mode="session">会话粘性</button>
+                  <button type="button" class="seg" data-mode="request">每次请求</button>
+                </div>
+                <span class="field-hint" id="modeHint">—</span>
+              </div>
+
+              <label class="field">
+                <span class="field-label">同一会话连续失败多少次后换 Key</span>
+                <input id="failThreshold" type="number" min="1" max="20" />
+                <span class="field-hint">额度/限流类错误会立即换 Key，不等这个次数。</span>
+              </label>
+
+              <div id="legacyLb" class="legacy-lb hidden">
+                <label class="field">
+                  <span class="field-label">旧策略（每次请求模式）</span>
+                  <span class="select-wrap block">
+                    <select id="lbStrategy">
+                      <option value="weighted">加权轮询</option>
+                      <option value="round-robin">轮询</option>
+                      <option value="weighted-random">加权随机</option>
+                      <option value="random">随机</option>
+                      <option value="sticky">粘性会话</option>
+                      <option value="least-recent">最久未用</option>
+                      <option value="failover">主备故障转移</option>
+                    </select>
+                  </span>
+                  <span class="field-hint" id="lbStrategyHint">—</span>
+                </label>
+                <label class="field" id="stickyByWrap">
+                  <span class="field-label">粘性维度</span>
+                  <span class="select-wrap block">
+                    <select id="lbStickyBy">
+                      <option value="client-key">客户端标识</option>
+                      <option value="ip">客户端 IP</option>
+                      <option value="none">不粘性</option>
+                    </select>
+                  </span>
+                </label>
+              </div>
+
+              <div class="grid-2">
+                <label class="field">
+                  <span class="field-label">换 Key 上限</span>
+                  <input id="lbMaxRetries" type="number" min="0" max="5" />
+                  <span class="field-hint">单次请求内</span>
+                </label>
+                <label class="field">
+                  <span class="field-label">Key 冷却 (ms)</span>
+                  <input id="lbCooldownMs" type="number" min="0" step="1000" />
+                  <span class="field-hint">失败后暂停用</span>
+                </label>
+              </div>
+
+              <button class="btn primary block" type="submit">
+                <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-check-circle"/></svg>
+                <span class="btn-label">保存调度设置</span>
+              </button>
+              <p class="hint foot-hint">会话粘性：一个会话固定一个 Key，新会话自动落到最空闲的 Key；Key 额度用尽或连续失败后，会话自动换到下一个可用 Key。</p>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div class="panel-title">
+                <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-refresh"/></svg></span>
+                <div>
+                  <h2>额度轮询</h2>
+                  <p class="hint">服务端定时查询额度，用尽即停用。</p>
+                </div>
+              </div>
+            </div>
+            <form id="pollForm" class="form">
+              <label class="sw">
+                <input type="checkbox" id="pollEnabled" />
+                <span class="track" aria-hidden="true"></span>
+                <span class="sw-text"><b>定时刷新额度</b><small>关闭时只能手动点「刷新全部额度」</small></span>
+              </label>
+
+              <label class="field" id="pollIntervalWrap">
+                <span class="field-label">刷新间隔</span>
+                <div class="grid-2">
+                  <span class="select-wrap block">
+                    <select id="pollPreset">
+                      <option value="1">每 1 分钟</option>
+                      <option value="5">每 5 分钟</option>
+                      <option value="15">每 15 分钟</option>
+                      <option value="30">每 30 分钟</option>
+                      <option value="60">每 1 小时</option>
+                      <option value="custom">自定义</option>
+                    </select>
+                  </span>
+                  <input id="pollCustom" type="number" min="1" max="1440" placeholder="分钟" />
+                </div>
+                <span class="field-hint">间隔越短，越早发现额度用尽；查询会占用少量请求。</span>
+              </label>
+
+              <label class="sw">
+                <input type="checkbox" id="autoDisable" />
+                <span class="track" aria-hidden="true"></span>
+                <span class="sw-text"><b>额度用尽自动停用</b><small>用尽后不再分发，额度恢复自动重新启用</small></span>
+              </label>
+
+              <label class="field">
+                <span class="field-label">全部 Key 都不可用时</span>
+                <span class="select-wrap block">
+                  <select id="onAllExhausted">
+                    <option value="error">明确报错（推荐）</option>
+                    <option value="best-effort">仍然尝试（可能失败）</option>
+                  </select>
+                </span>
+              </label>
+
+              <div class="poll-status" id="pollStatus"></div>
+
+              <button class="btn primary block" type="submit">
+                <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-check-circle"/></svg>
+                <span class="btn-label">保存轮询设置</span>
+              </button>
+            </form>
+          </section>
+        </div>
+      </section>
+
+      <!-- ══ 标签页 3：会话 ════════════════════════════════════ -->
+      <section class="tab-panel" id="panel-sessions" data-panel="sessions" role="tabpanel" aria-labelledby="tabBtnSessions" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <div class="panel-title">
+              <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-share"/></svg></span>
+              <div>
+                <h2>会话分布</h2>
+                <p class="hint">每个会话固定一个 Key，新会话自动落到最空闲的 Key。绑定存在内存里，重启后会重新分散。</p>
+              </div>
+            </div>
+            <div class="panel-tools">
+              <button id="btnClearSessions" class="btn ghost sm" type="button" title="清空绑定，所有会话下次请求重新分配">
+                <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-x"/></svg>
+                <span class="btn-label">清空绑定</span>
+              </button>
+            </div>
+          </div>
+          <div id="sessionList" class="session-list"></div>
+        </section>
+      </section>
+
+    </main>
+
+    <footer class="foot">
+      <span class="foot-left">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-shield"/></svg>
+        Command Code Proxy · 本地管理台
+      </span>
+      <span class="foot-right">
+        <span id="lastSync" class="foot-sync"></span>
+        <p data-aigc-mark="1" class="aigc-mark">AI生成</p>
+      </span>
+    </footer>
+  </div>
+
+  <!-- ── 添加 / 编辑 Key ────────────────────────────────────── -->
+  <dialog id="dlgKey" class="dialog">
+    <form id="keyForm" class="dlg-form">
+      <header class="dlg-head">
+        <div class="panel-title">
+          <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-key"/></svg></span>
+          <div>
+            <h3 id="dlgTitle">添加 Key</h3>
+            <p class="hint" id="dlgSub">录入一个 <code>user_*</code> Key，加入分发池。</p>
+          </div>
+        </div>
+        <button type="button" class="icon-btn" id="dlgClose" aria-label="关闭">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </header>
+
+      <div class="dlg-body">
+        <input type="hidden" id="editId" />
+
+        <label class="field">
+          <span class="field-label">标签</span>
+          <input id="keyLabel" placeholder="例如：主力号 / 备用号" autocomplete="off" />
+          <span class="field-hint">仅用于区分账号，可随时修改。</span>
+        </label>
+
+        <label class="field" id="wrapKeyValue">
+          <span class="field-label">API Key</span>
+          <input id="keyValue" class="mono-input" placeholder="user_..." autocomplete="off" spellcheck="false" />
+          <span class="field-hint">需匹配 <code>^user_[A-Za-z0-9_-]+$</code>，仅保存在本机 <code>keys.json</code>。</span>
+        </label>
+
+        <div class="grid-2">
+          <label class="field">
+            <span class="field-label">权重</span>
+            <input id="keyWeight" type="number" min="0" value="1" />
+            <span class="field-hint">越大越常被选中。</span>
+          </label>
+          <label class="field">
+            <span class="field-label">优先级</span>
+            <input id="keyPriority" type="number" value="0" />
+            <span class="field-hint">故障转移排序依据。</span>
+          </label>
+        </div>
+
+        <div class="switch-list">
+          <label class="sw">
+            <input type="checkbox" id="keyEnabled" checked />
+            <span class="track" aria-hidden="true"></span>
+            <span class="sw-text"><b>启用</b><small>关闭后不参与请求分发</small></span>
+          </label>
+          <label class="sw">
+            <input type="checkbox" id="keyDefault" />
+            <span class="track" aria-hidden="true"></span>
+            <span class="sw-text"><b>设为默认 Key</b><small>优先使用，失败后回落到其它 Key</small></span>
+          </label>
+        </div>
+      </div>
+
+      <footer class="dlg-actions">
+        <button type="button" class="btn ghost" id="dlgCancel">取消</button>
+        <button type="submit" class="btn primary">保存</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- ── 确认弹窗 ───────────────────────────────────────────── -->
+  <dialog id="dlgConfirm" class="dialog">
+    <div class="dlg-form">
+      <header class="dlg-head">
+        <div class="panel-title">
+          <span class="pi tone-danger" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-alert"/></svg></span>
+          <div>
+            <h3 id="confirmTitle">确认操作</h3>
+            <p class="hint" id="confirmMsg">—</p>
+          </div>
+        </div>
+      </header>
+      <footer class="dlg-actions">
+        <button type="button" class="btn ghost" id="confirmCancel">取消</button>
+        <button type="button" class="btn danger" id="confirmOk">删除</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="./admin.js"></script>
+</body>
+</html>
