@@ -432,8 +432,11 @@ Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the
 
 ```bash
 docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
-docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
+  -v "$PWD/data:/app/data" ghcr.io/maxeaglet/commandcode-proxy:latest
 ```
+
+> ⚠️ The `-v` mount is required. The key pool lives in `/app/data/keys.json` inside the container, so without a volume **recreating the container or updating the image wipes every key**. See [Data persistence](#data-persistence-important).
 
 The `latest` tag is updated on each release. The image is public — no login required to pull.
 
@@ -449,11 +452,29 @@ The proxy will listen on `http://0.0.0.0:3050`. Set `PROXY_PORT` to customize th
 PROXY_PORT=13050 docker compose up -d
 ```
 
+### Data Persistence (important)
+
+All key-pool state lives in a single JSON file (`/app/data/keys.json` inside the container). It sits in the **container writable layer** by default, so:
+
+- **`docker compose`**: the `./data:/app/data` mount is built in — keys are written to `./data/keys.json` on the host and survive container recreation / image updates.
+- **Plain `docker run`**: you must add `-v` yourself, otherwise `docker rm` + `run` again, or recreating with a newer image, loses every key.
+- **Custom path**: set `CC_KEYS_FILE` (e.g. `-e CC_KEYS_FILE=/app/data/keys.json`) and make sure that directory is mounted.
+
+To carry over keys you already configured locally, just copy the file:
+
+```bash
+mkdir -p data && cp keys.json data/keys.json
+docker compose up -d
+```
+
+Keys are stored **in plaintext** in that file — `chmod 600 data/keys.json` is recommended, and do not commit `data/` to Git (already covered by `.gitignore`).
+
 ### Build from Source
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
+docker run -d -p 3050:3050 -e PORT=3050 \
+  -v "$PWD/data:/app/data" commandcode-proxy:latest
 ```
 
 ### Multi-Architecture Build
@@ -468,6 +489,7 @@ npm run docker:build:multi
 |----------|---------|-------------|
 | `PORT` | `3050` | Container listen port |
 | `PROXY_PORT` | `3050` | Host port (compose only) |
+| `CC_KEYS_FILE` | `keys.json` next to the script (image default: `/app/data/keys.json`) | Key-pool file path; point it at a mounted volume in containers — see [Data persistence](#data-persistence-important) |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests are rejected with `HTTP 413` |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | *(unset = disabled)* | Drop the client and abort upstream when downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout in ms; see [Upstream idle timeouts](#upstream-idle-timeouts) |

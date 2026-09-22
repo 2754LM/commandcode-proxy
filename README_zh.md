@@ -430,8 +430,11 @@ CLI 发送图片的格式：
 
 ```bash
 docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
-docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
+  -v "$PWD/data:/app/data" ghcr.io/maxeaglet/commandcode-proxy:latest
 ```
+
+> ⚠️ 必须挂 `-v`。Key 池只存在容器内的 `/app/data/keys.json`，不挂卷时**重建容器或更新镜像会把所有 Key 一起丢掉**，见[数据持久化](#数据持久化重要)。
 
 每次发版都会更新 `latest` 标签。镜像为公共可见，拉取无需登录。
 
@@ -446,6 +449,23 @@ docker compose up -d
 ```bash
 PROXY_PORT=13050 docker compose up -d
 ```
+
+### 数据持久化（重要）
+
+Key 池全部状态只存在一个 JSON 文件里（容器内路径 `/app/data/keys.json`）。它默认位于**容器可写层**，所以：
+
+- **`docker compose`**：已内置 `./data:/app/data` 挂载，Key 会落到宿主机 `./data/keys.json`，重建容器 / 更新镜像都不丢。
+- **裸 `docker run`**：必须自己挂 `-v`，否则 `docker rm` 后重新 `run`、或拉新版镜像重建，Key 全部丢失。
+- **换路径**：用 `CC_KEYS_FILE` 指定（如 `-e CC_KEYS_FILE=/app/data/keys.json`），并确保该目录已挂载。
+
+首次部署想把本机已配好的 Key 带过去，直接复制文件：
+
+```bash
+mkdir -p data && cp keys.json data/keys.json
+docker compose up -d
+```
+
+Key 以**明文**保存在该文件里 —— 建议 `chmod 600 data/keys.json`，并且不要把 `data/` 提交进 Git（`.gitignore` 已包含）。
 
 ### 从源码构建
 
@@ -466,6 +486,7 @@ npm run docker:build:multi
 |------|--------|------|
 | `PORT` | `3050` | 容器内监听端口 |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
+| `CC_KEYS_FILE` | 与脚本同目录的 `keys.json`（镜像内默认 `/app/data/keys.json`）| Key 池文件路径，容器里指向挂载卷；见[数据持久化](#数据持久化重要) |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |

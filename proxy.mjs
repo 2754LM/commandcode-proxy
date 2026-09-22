@@ -5,7 +5,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, writeFileSync, renameSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -50,6 +50,628 @@ function loadConfig() {
 }
 
 const CFG = loadConfig();
+
+// ── Key 池 + 负载均衡 ─────────────────────────────────
+// keys.json（gitignore）：{ lb: {...}, keys: [{ id, label, key, weight, enabled, priority, ... }] }
+// 客户端 header 里的 user_* 仍可直通（BYOK）；未带 key 时从池里按策略选取。
+
+// 默认放在 proxy.mjs 同目录；容器里用 CC_KEYS_FILE 指到挂载卷（如 /app/data/keys.json），
+// 否则 docker compose 重建容器会把 Key 池一起丢掉。
+const KEYS_PATH = process.env.CC_KEYS_FILE
+  ? resolve(process.env.CC_KEYS_FILE)
+  : resolve(__dirname, 'keys.json');
+
+const LB_DEFAULTS = {
+  strategy: 'weighted',          // round-robin | weighted | random | weighted-random | sticky | least-recent | failover
+  stickyBy: 'client-key',        // none | ip | client-key
+  maxRetries: 2,                 // 可重试失败时最多再换几个 key
+  cooldownMs: 60000,             // 失败后暂时跳过
+};
+
+// 调度设置（中转站场景）：会话粘性 + 失败/额度触发转移 + 额度轮询
+const SETTINGS_DEFAULTS = {
+  mode: 'session',               // session（会话粘性，默认）| request（每次请求按策略选）
+  failThreshold: 3,              // 同一会话在同一 Key 上连续失败几次后换 Key
+  sessionTtlMs: 6 * 60 * 60 * 1000, // 会话绑定有效期（超时回收）
+  creditsRefreshMs: 15 * 60 * 1000, // 服务端定时刷新额度间隔（默认 15 分钟），0 = 关闭
+  autoDisableExhausted: true,    // 额度用尽自动停用（额度恢复后自动恢复）
+  onAllExhausted: 'error',       // 池内全部不可用时：error（明确报错）| best-effort（仍然尝试）
+};
+
+let keyStore = {
+  lb: { ...LB_DEFAULTS },
+  settings: { ...SETTINGS_DEFAULTS },
+  keys: [],
+  defaultId: null,
+};
+let rrIndex = 0;
+const wrrCurrent = new Map();
+
+/** 会话 → Key 绑定（会话粘性模式的核心状态，仅内存，重启后按需重建） */
+const sessionRoutes = new Map(); // sessionId → { keyId, boundAt, lastAt, failures, moved }
+
+function newKeyId() {
+  return 'key_' + crypto.randomBytes(4).toString('hex');
+}
+
+function findKey(id) {
+  return keyStore.keys.find((k) => k.id === id) || null;
+}
+
+/** 设置项（带范围收敛，防止前端传脏数据） */
+function normalizeSettings(raw) {
+  const s = { ...SETTINGS_DEFAULTS, ...(raw || {}) };
+  s.mode = s.mode === 'request' ? 'request' : 'session';
+  s.failThreshold = Math.max(1, Math.min(20, Number(s.failThreshold) || SETTINGS_DEFAULTS.failThreshold));
+  s.sessionTtlMs = Math.max(60000, Math.min(7 * 24 * 3600 * 1000, Number(s.sessionTtlMs) || SETTINGS_DEFAULTS.sessionTtlMs));
+  s.creditsRefreshMs = Math.max(0, Math.min(24 * 3600 * 1000, Number(s.creditsRefreshMs) || 0));
+  s.autoDisableExhausted = s.autoDisableExhausted !== false;
+  s.onAllExhausted = s.onAllExhausted === 'best-effort' ? 'best-effort' : 'error';
+  return s;
+}
+
+function loadKeyStore() {
+  try {
+    const raw = JSON.parse(readFileSync(KEYS_PATH, 'utf-8'));
+    keyStore.lb = { ...LB_DEFAULTS, ...(raw?.lb || {}) };
+    keyStore.settings = normalizeSettings(raw?.settings);
+    keyStore.keys = (raw?.keys || []).filter((k) => k?.key).map((k) => ({
+      id: k.id || newKeyId(),
+      label: k.label || '',
+      key: k.key,
+      weight: Number.isFinite(+k.weight) ? Math.max(0, +k.weight) : 1,
+      enabled: k.enabled !== false,
+      priority: Number.isFinite(+k.priority) ? +k.priority : 0,
+      createdAt: k.createdAt || Date.now(),
+      lastUsedAt: k.lastUsedAt || null,
+      lastErrorAt: k.lastErrorAt || null,
+      errorCount: k.errorCount || 0,
+      cooldownUntil: k.cooldownUntil || 0,
+      consecutiveFailures: k.consecutiveFailures || 0,
+      autoDisabled: k.autoDisabled && k.autoDisabled.at
+        ? { reason: String(k.autoDisabled.reason || 'unknown'), at: k.autoDisabled.at, until: k.autoDisabled.until || null }
+        : null,
+      credits: k.credits && typeof k.credits === 'object' ? k.credits : null,
+    }));
+    keyStore.defaultId = findKey(raw?.defaultId) ? raw.defaultId : null;
+    rrIndex = 0;
+    wrrCurrent.clear();
+    sessionRoutes.clear();
+  } catch {
+    keyStore = {
+      lb: { ...LB_DEFAULTS },
+      settings: { ...SETTINGS_DEFAULTS },
+      keys: [],
+      defaultId: null,
+    };
+  }
+}
+
+function saveKeyStore() {
+  const tmp = KEYS_PATH + '.tmp';
+  // 目录可能还不存在（首次挂载空卷）；tmp 与目标同目录，保证 rename 仍是原子替换
+  mkdirSync(dirname(KEYS_PATH), { recursive: true });
+  writeFileSync(tmp, JSON.stringify({
+    lb: keyStore.lb,
+    settings: keyStore.settings,
+    keys: keyStore.keys,
+    defaultId: keyStore.defaultId,
+  }, null, 2), 'utf-8');
+  renameSync(tmp, KEYS_PATH);
+}
+
+function extractClientApiKey(headers) {
+  const auth = headers['authorization'] || headers['Authorization'] || '';
+  if (auth.startsWith('Bearer ')) {
+    const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
+    if (match) return match[0];
+  }
+  const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
+  if (xKey) {
+    const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
+    if (match) return match[0];
+  }
+  return null;
+}
+
+function getFallbackApiKey() {
+  if (CFG.apiKey) return CFG.apiKey;
+  if (process.env.CC_API_KEY) return process.env.CC_API_KEY.trim();
+  return null;
+}
+
+function isKeyReady(k, now = Date.now()) {
+  return !!(k && k.enabled && k.key && (!k.cooldownUntil || k.cooldownUntil <= now));
+}
+
+function poolCandidates(excludeTried, now = Date.now()) {
+  const notTried = (k) => !excludeTried || !excludeTried.has(k.id);
+  const live = keyStore.keys.filter((k) => notTried(k) && isKeyReady(k, now));
+  if (live.length) return live;
+  // 全在冷却时放行，避免无 key 可用
+  return keyStore.keys.filter((k) => notTried(k) && k.enabled && k.key);
+}
+
+function stickyValue(req, clientKey) {
+  const by = keyStore.lb.stickyBy || 'none';
+  if (by === 'ip') return req?.socket?.remoteAddress || req?.headers?.['x-forwarded-for'] || 'ip';
+  if (by === 'client-key') return clientKey || req?.socket?.remoteAddress || 'anon';
+  return null;
+}
+
+function pickByStrategy(candidates, req, clientKey) {
+  if (!candidates.length) return null;
+  const strategy = keyStore.lb.strategy || 'weighted';
+
+  if (strategy === 'sticky') {
+    const sv = stickyValue(req, clientKey);
+    if (sv) {
+      let h = 0;
+      for (let i = 0; i < sv.length; i++) h = (h * 31 + sv.charCodeAt(i)) | 0;
+      return candidates[Math.abs(h) % candidates.length];
+    }
+  }
+
+  if (strategy === 'least-recent') {
+    return candidates.reduce((a, b) => ((a.lastUsedAt || 0) <= (b.lastUsedAt || 0) ? a : b));
+  }
+
+  if (strategy === 'failover') {
+    return [...candidates].sort((a, b) =>
+      (a.priority || 0) - (b.priority || 0) || (a.lastUsedAt || 0) - (b.lastUsedAt || 0)
+    )[0];
+  }
+
+  if (strategy === 'random') {
+    return candidates[Math.floor(Math.random() * candidates.length)];
+  }
+
+  if (strategy === 'round-robin') {
+    rrIndex = (rrIndex + 1) % candidates.length;
+    return candidates[rrIndex];
+  }
+
+  if (strategy === 'weighted-random') {
+    const total = candidates.reduce((s, k) => s + Math.max(0, k.weight || 0), 0);
+    if (total <= 0) return candidates[Math.floor(Math.random() * candidates.length)];
+    let r = Math.random() * total;
+    for (const k of candidates) {
+      r -= Math.max(0, k.weight || 0);
+      if (r <= 0) return k;
+    }
+    return candidates[candidates.length - 1];
+  }
+
+  // weighted — nginx 平滑加权轮询
+  let total = 0;
+  let best = null;
+  for (const k of candidates) {
+    const w = Math.max(0, k.weight || 0);
+    total += w;
+    const cur = (wrrCurrent.get(k.id) || 0) + w;
+    wrrCurrent.set(k.id, cur);
+    if (!best || cur > wrrCurrent.get(best.id)) best = k;
+  }
+  if (best && total > 0) wrrCurrent.set(best.id, wrrCurrent.get(best.id) - total);
+  return best;
+}
+
+function markKeyUsed(entry) {
+  if (entry) entry.lastUsedAt = Date.now();
+}
+
+function markKeySuccess(pick) {
+  if (!pick?.id) return;
+  const k = findKey(pick.id);
+  if (!k) return;
+  k.errorCount = 0;
+  k.consecutiveFailures = 0;
+  k.cooldownUntil = 0;
+  k.lastErrorAt = null;
+}
+
+/**
+ * 记录一次上游失败。
+ * trigger: quota-exhausted（额度/限流）| disabled（凭证失效）| forbidden（403，可能是套餐/权限）
+ *          | any-error（5xx/网络等）
+ * 会话模式下，普通错误要连续失败达到 failThreshold 才弃用该 Key；
+ * 额度类错误立即冷却（并按设置自动停用）；403 只换 Key，不惩罚该 Key。
+ */
+function markKeyFailure(pick, status, retryable, trigger = 'any-error', bodyText = '') {
+  if (!pick?.id) return;
+  const k = findKey(pick.id);
+  if (!k) return;
+  const now = Date.now();
+  k.lastErrorAt = now;
+  k.errorCount = (k.errorCount || 0) + 1;
+
+  // 请求级限制（例如套餐不含该模型）：换个 Key 试试即可，不要把 Key 标记成坏 Key
+  if (trigger === 'forbidden') {
+    saveKeyStore();
+    return;
+  }
+
+  k.consecutiveFailures = (k.consecutiveFailures || 0) + 1;
+
+  const quotaLike = trigger === 'quota-exhausted' || trigger === 'disabled';
+  if (quotaLike) {
+    const cool = Math.max(0, keyStore.lb.cooldownMs || 0);
+    k.cooldownUntil = now + cool;
+    // 额度/限流：优先用上游给的窗口重置时间，拿不到就用冷却时长兜底
+    if (trigger === 'quota-exhausted') {
+      const until = quotaResetFromError(bodyText) || now + Math.max(cool, 5 * 60 * 1000);
+      setAutoDisabled(k, 'quota-exhausted', until);
+    }
+  } else if (retryable) {
+    const sessionMode = keyStore.settings.mode === 'session';
+    const threshold = Math.max(1, keyStore.settings.failThreshold || 3);
+    if (!sessionMode || k.consecutiveFailures >= threshold) {
+      k.cooldownUntil = now + Math.max(0, keyStore.lb.cooldownMs || 0);
+    }
+  }
+  saveKeyStore();
+}
+
+function isRetryableCcFailure(status, bodyText) {
+  if (status === 401 || status === 402 || status === 403 || status === 429) return true;
+  return /insufficient\s+(?:credits|balance)|usage_limit_reached|quota\s+(?:exceeded|reached)|USAGE_EXCEEDED|rate.?limit|free.?usage.?limit/i.test(String(bodyText || ''));
+}
+
+/**
+ * 始终从 GUI 配置的 Key 池里选取上游 Key，忽略请求头里的 Authorization / x-api-key。
+ * excludeTried: Set<keyId>，failover 重试时排除已试过的。
+ * sticky 策略仍可用客户端 Key/IP 做哈希，但只影响落到哪个池内 Key，不会直通该 Key。
+ */
+function pickUpstreamKey(clientKey, req, excludeTried) {
+  // 默认 Key 优先（未禁用、未冷却、本轮未试过）
+  if (keyStore.defaultId) {
+    const def = findKey(keyStore.defaultId);
+    if (def && def.enabled && def.key && !excludeTried?.has(def.id) && isKeyReady(def)) {
+      markKeyUsed(def);
+      return { apiKey: def.key, id: def.id, label: def.label };
+    }
+  }
+
+  const candidates = poolCandidates(excludeTried);
+  if (!candidates.length) return null;
+
+  const entry = pickByStrategy(candidates, req, clientKey);
+  if (!entry) return null;
+  markKeyUsed(entry);
+  return { apiKey: entry.key, id: entry.id, label: entry.label };
+}
+
+// ══════════════════════════════════════════════════════════
+// 中转站调度：额度健康 + 会话粘性分配
+// 目标：多会话（多个 agent）自然分散到不同 Key；某个 Key 额度用尽或连续
+// 失败后自动换 Key，正在跑的会话不会被打断。
+// ══════════════════════════════════════════════════════════
+
+/** 额度是否用尽：剩余 <= 0，或任一窗口已满 */
+function isQuotaExhausted(k) {
+  const c = k?.credits;
+  if (!c || c.error) return false;
+  if (typeof c.creditsRemaining === 'number' && c.creditsRemaining <= 0.000001) return true;
+  return Array.isArray(c.windows) && c.windows.some((w) => Number(w.pct) >= 100);
+}
+
+/**
+ * 预计多久后额度恢复：
+ * 窗口类限额 → 取已满窗口最晚的重置时间；余额为 0 或时间未知 → null（需等额度刷新或充值）。
+ */
+function quotaRecoveryAt(k) {
+  const c = k?.credits;
+  if (!c || c.error) return null;
+  const full = (c.windows || []).filter((w) => Number(w.pct) >= 100);
+  if (!full.length) return null;
+  const resets = full.map((w) => Number(w.resetsAt)).filter((t) => t > Date.now());
+  return resets.length ? Math.max(...resets) : null;
+}
+
+/** 自动停用是否仍然生效（到点自动失效，避免"停用后再也起不来"） */
+function autoDisableActive(k, now = Date.now()) {
+  if (!k?.autoDisabled) return false;
+  if (k.autoDisabled.until && k.autoDisabled.until <= now) return false;
+  return true;
+}
+
+/** 是否可作为上游候选：启用、有 key、未冷却、未被自动停用 */
+function isKeyUsable(k, now = Date.now()) {
+  if (!k || !k.key || !k.enabled) return false;
+  if (autoDisableActive(k, now)) return false;
+  if (k.cooldownUntil && k.cooldownUntil > now) return false;
+  return true;
+}
+
+function keyUnusableReason(k, now = Date.now()) {
+  if (!k || !k.key) return 'removed';
+  if (!k.enabled) return 'disabled';
+  if (autoDisableActive(k, now)) return 'auto-disabled:' + k.autoDisabled.reason;
+  if (k.cooldownUntil && k.cooldownUntil > now) return 'cooldown';
+  return 'unknown';
+}
+
+/**
+ * 标记自动停用。
+ * until：到点自动恢复（窗口限额用窗口重置时间；上游报错用冷却时长兜底）
+ */
+function setAutoDisabled(k, reason, until = null) {
+  if (!keyStore.settings.autoDisableExhausted) return;
+  const sameUntil = k.autoDisabled && k.autoDisabled.reason === reason && k.autoDisabled.until === until;
+  if (sameUntil) return;
+  k.autoDisabled = { reason, at: Date.now(), until };
+  log('warn', 'Key auto-disabled', {
+    keyId: k.id, label: k.label, reason,
+    until: until ? new Date(until).toISOString() : null,
+  });
+}
+
+/** 清掉已到期的自动停用标记 */
+function expireAutoDisables(now = Date.now()) {
+  let cleared = 0;
+  for (const k of keyStore.keys) {
+    if (k.autoDisabled && k.autoDisabled.until && k.autoDisabled.until <= now) {
+      k.autoDisabled = null;
+      cleared++;
+      log('info', 'Key auto-enable (recovery time reached)', { keyId: k.id, label: k.label });
+    }
+  }
+  return cleared;
+}
+
+/** 额度刷新后同步自动停用状态：用尽则停用（带恢复时间），恢复则重新启用 */
+function syncAutoDisable(k, now = Date.now()) {
+  if (!keyStore.settings.autoDisableExhausted) {
+    if (k.autoDisabled) k.autoDisabled = null;
+    return;
+  }
+  if (isQuotaExhausted(k)) {
+    const until = quotaRecoveryAt(k);
+    if (!k.autoDisabled || k.autoDisabled.reason !== 'quota-exhausted') {
+      k.autoDisabled = { reason: 'quota-exhausted', at: now, until };
+      log('warn', 'Key exhausted, auto-disabled', {
+        keyId: k.id, label: k.label,
+        until: until ? new Date(until).toISOString() : null,
+      });
+    } else if (k.autoDisabled.until !== until) {
+      k.autoDisabled.until = until; // 窗口重置时间会变，跟随更新
+    }
+    return;
+  }
+  // 未用尽：额度数据比停用时刻新，或已到恢复时间 → 认定恢复
+  if (k.autoDisabled
+    && ((k.credits?.fetchedAt || 0) > k.autoDisabled.at
+      || (k.autoDisabled.until && k.autoDisabled.until <= now))) {
+    k.autoDisabled = null;
+    log('info', 'Key recovered, auto-enabled', { keyId: k.id, label: k.label });
+  }
+}
+
+/** 会话指纹用的文本提取（支持 string / 内容块数组） */
+function textOfContent(v) {
+  if (!v) return '';
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.map(textOfContent).filter(Boolean).join('\n');
+  if (typeof v === 'object') return textOfContent(v.text || v.content || v.input || '');
+  return '';
+}
+
+/** 会话指纹：模型 + system + 首条 user 消息（同一会话多轮请求保持稳定） */
+function sessionSeed(body, clientKey) {
+  if (!body || typeof body !== 'object') return '';
+  const p = body.params && typeof body.params === 'object' ? body.params : {};
+  const sys = textOfContent(body.system) || textOfContent(body.instructions) || textOfContent(p.system);
+  const msgs = Array.isArray(body.messages) ? body.messages
+    : Array.isArray(p.messages) ? p.messages
+      : Array.isArray(body.input) ? body.input : [];
+  let firstUser = '';
+  for (const m of msgs) {
+    if (!m) continue;
+    if (typeof m === 'string') { firstUser = m; break; }
+    if (m.role === 'user' || m.role === 'human') { firstUser = textOfContent(m.content ?? m.input); break; }
+  }
+  if (!sys && !firstUser) return '';
+  return `${clientKey || ''}|${body.model || p.model || ''}|${sys.slice(0, 1500)}|${firstUser.slice(0, 3000)}`;
+}
+
+/**
+ * 推导"会话"标识：显式 header > metadata > 内容指纹。
+ * 无法识别时返回 null，调用方退化为按请求选 Key。
+ */
+function deriveSessionId(req, body, clientKey) {
+  const h = req?.headers || {};
+  const direct = h['x-cc-session'] || h['x-session-id'] || h['x-conversation-id'] || h['conversation-id'];
+  if (direct && String(direct).trim().length >= 6) return 'h_' + String(direct).trim().slice(0, 100);
+  const meta = body?.metadata || {};
+  const uid = meta.user_id || meta.session_id || meta.conversation_id || body?.user;
+  if (uid && typeof uid === 'string' && uid.length >= 6) return 'm_' + uid.slice(0, 100);
+  const seed = sessionSeed(body, clientKey);
+  if (!seed) return null;
+  return 'f_' + crypto.createHash('sha1').update(seed).digest('hex').slice(0, 16);
+}
+
+function pruneSessionRoutes(now = Date.now()) {
+  if (!sessionRoutes.size) return;
+  const ttl = keyStore.settings.sessionTtlMs;
+  for (const [id, rec] of sessionRoutes) {
+    if (now - rec.lastAt > ttl) sessionRoutes.delete(id);
+  }
+}
+
+function activeSessionCounts(now = Date.now()) {
+  const counts = new Map();
+  const ttl = keyStore.settings.sessionTtlMs;
+  for (const rec of sessionRoutes.values()) {
+    if (now - rec.lastAt > ttl) continue;
+    counts.set(rec.keyId, (counts.get(rec.keyId) || 0) + 1);
+  }
+  return counts;
+}
+
+/** 分散选 Key：活跃会话最少 → 默认 Key 优先 → 最久未用 → 权重最大 */
+function pickBySpreading(pool, now) {
+  if (!pool.length) return null;
+  const counts = activeSessionCounts(now);
+  return [...pool].sort((a, b) =>
+    (counts.get(a.id) || 0) - (counts.get(b.id) || 0)
+    || Number(b.id === keyStore.defaultId) - Number(a.id === keyStore.defaultId)
+    || (a.lastUsedAt || 0) - (b.lastUsedAt || 0)
+    || (b.weight || 0) - (a.weight || 0)
+  )[0];
+}
+
+/** 会话模式下选 Key；abandoned 为本轮已放弃的 Key id */
+function pickSessionKey(sessionId, clientKey, req, body, abandoned) {
+  const now = Date.now();
+  if (sessionRoutes.size > 256) pruneSessionRoutes(now);
+  const tried = abandoned || new Set();
+
+  // 1) 已有绑定且仍可用 → 继续用同一个 Key（会话粘性）
+  if (sessionId) {
+    const rec = sessionRoutes.get(sessionId);
+    if (rec && !tried.has(rec.keyId)) {
+      const bound = findKey(rec.keyId);
+      if (bound && isKeyUsable(bound, now)) {
+        rec.lastAt = now;
+        markKeyUsed(bound);
+        return { apiKey: bound.key, id: bound.id, label: bound.label, sessionId };
+      }
+      if (bound) {
+        log('info', 'Session rebind', {
+          session: sessTag(sessionId), from: rec.keyId, reason: keyUnusableReason(bound, now),
+        });
+      }
+      sessionRoutes.delete(sessionId);
+    }
+  }
+
+  // 2) 新会话 / 需要换 Key → 分散到活跃会话最少的可用 Key
+  const pool = keyStore.keys.filter((k) => isKeyUsable(k, now) && !tried.has(k.id));
+  const chosen = pickBySpreading(pool, now);
+  if (!chosen) return null;
+  markKeyUsed(chosen);
+  if (sessionId) {
+    const counts = activeSessionCounts(now);
+    sessionRoutes.set(sessionId, { keyId: chosen.id, boundAt: now, lastAt: now, failures: 0 });
+    log('info', 'Session bound', {
+      session: sessTag(sessionId),
+      keyId: chosen.id,
+      label: chosen.label,
+      activeSessionsBefore: counts.get(chosen.id) || 0,
+      poolSize: pool.length,
+    });
+  }
+  return { apiKey: chosen.key, id: chosen.id, label: chosen.label, sessionId };
+}
+
+/** 兜底：所有 Key 都不可用时（onAllExhausted=best-effort）仍然挑一个 */
+function pickBestEffort(abandoned) {
+  const tried = abandoned || new Set();
+  const pool = keyStore.keys.filter((k) => k.key && k.enabled && !tried.has(k.id));
+  if (!pool.length) return null;
+  const fresh = pool.filter((k) => !isQuotaExhausted(k));
+  const target = (fresh.length ? fresh : pool)
+    .slice()
+    .sort((a, b) => (a.cooldownUntil || 0) - (b.cooldownUntil || 0) || (b.weight || 0) - (a.weight || 0))[0];
+  if (!target) return null;
+  markKeyUsed(target);
+  return { apiKey: target.key, id: target.id, label: target.label, bestEffort: true };
+}
+
+/** 上游失败归类，决定是"立即换"还是"再试几次" */
+function classifyFailure(status, bodyText) {
+  const text = String(bodyText || '');
+  if (status === 401) return 'disabled';
+  if (status === 402 || status === 429) return 'quota-exhausted';
+  // 403：可能是 Key 无权限，也可能是"套餐不含该模型"这类请求级限制。
+  // 后者不该惩罚 Key（否则一次请求就能把整个池冷却掉），所以单独归类，只换 Key 不冷却。
+  if (status === 403) return 'forbidden';
+  if (/insufficient\s+(?:credits|balance)|usage_limit_reached|quota\s+(?:exceeded|reached)|USAGE_EXCEEDED|rate.?limit|free.?usage.?limit/i
+    .test(text)) return 'quota-exhausted';
+  if (/UNAUTHORIZED|invalid.{0,20}(api.?key|token)/i.test(text)) return 'disabled';
+  return 'any-error';
+}
+
+function recordSessionFailure(sessionId, trigger) {
+  if (!sessionId) return;
+  const rec = sessionRoutes.get(sessionId);
+  if (!rec) return;
+  rec.failures = (rec.failures || 0) + 1;
+  rec.lastAt = Date.now();
+  log('warn', 'Session failure', {
+    session: sessTag(sessionId), keyId: rec.keyId, failures: rec.failures, trigger,
+  });
+}
+
+/** 会话日志/界面用的短标识：稳定、唯一，且不泄露客户端原始 session id */
+function sessTag(sid) {
+  return 'sess#' + crypto.createHash('sha1').update(String(sid)).digest('hex').slice(0, 7);
+}
+
+/**
+ * 从上游错误体里解析"额度何时恢复"。
+ * 例：{"rateLimit":{"limit":6,"remaining":0,"reset":1790171713,"window":"weekly"}}
+ *     "You've reached your weekly usage limit ... resets at 2026-09-23T13:55:13.843Z"
+ * 解析得到就能让 Key 一直停用到窗口真正重置，避免每 5 分钟重试一次的来回抖动。
+ */
+function quotaResetFromError(bodyText) {
+  const s = String(bodyText || '');
+  if (!s) return null;
+  const reset = s.match(/"reset"\s*:\s*(\d{9,13})/);
+  if (reset) {
+    const n = Number(reset[1]);
+    const ms = n > 1e11 ? n : n * 1000; // 秒 / 毫秒都兼容
+    if (isFinite(ms) && ms > Date.now()) return ms;
+  }
+  const iso = s.match(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)/);
+  if (iso) {
+    const t = Date.parse(iso[1]);
+    if (isFinite(t) && t > Date.now()) return t;
+  }
+  return null;
+}
+
+function recordSessionSuccess(sessionId) {
+  if (!sessionId) return;
+  const rec = sessionRoutes.get(sessionId);
+  if (rec) rec.failures = 0;
+}
+
+function hasAnyUsableKey() {
+  return keyStore.keys.some((k) => isKeyUsable(k));
+}
+
+/** 池整体不可用时的错误响应（区分"空池"和"全部用尽/冷却"） */
+function poolUnavailableResponse() {
+  const now = Date.now();
+  const total = keyStore.keys.length;
+  if (!total) {
+    return { status: 401, body: { error: { message: 'Key 池为空，请先在管理页 http://<host>:<port>/ 配置至少一个 user_* Key', type: 'auth_error' } } };
+  }
+  const exhausted = keyStore.keys.filter((k) => k.autoDisabled).length;
+  const cooling = keyStore.keys.filter((k) => k.cooldownUntil > now).length;
+  const off = keyStore.keys.filter((k) => !k.enabled).length;
+  return {
+    status: 429,
+    body: {
+      error: {
+        message: `池内 ${total} 个 Key 当前都不可用（额度用尽 ${exhausted} · 冷却中 ${cooling} · 已停用 ${off}），请补充 Key 或在管理页查看额度`,
+        type: 'rate_limit_error',
+      },
+    },
+  };
+}
+
+// 兼容旧函数名（handleModels 等仍在用）——同样只走池
+function getApiKey(headers) {
+  const req = { headers, socket: { remoteAddress: '' } };
+  const picked = keyStore.settings.mode === 'session'
+    ? pickSessionKey(null, extractClientApiKey(headers), req, null, null)
+    : pickUpstreamKey(extractClientApiKey(headers), req, null);
+  return picked?.apiKey || null;
+}
+
+loadKeyStore();
 
 // ── 指纹生成（首次运行自动生成，写回 config.json） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
@@ -205,6 +827,13 @@ function log(level, msg, data) {
     try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
   }
 }
+
+log('info', 'Key pool loaded', {
+  path: KEYS_PATH,
+  keys: keyStore.keys.length,
+  enabled: keyStore.keys.filter((k) => k.enabled).length,
+  strategy: keyStore.lb.strategy,
+});
 
 // 把上游错误体摘要成单行，便于日志排查。
 // 之前 CC API error 只记 status，不记 body —— 遇到 400 只能靠猜（问题来源见 hk_sji 排查）。
@@ -941,22 +1570,6 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function getApiKey(headers) {
-  // Try Authorization: Bearer header (OpenAI SDK style)
-  const auth = headers['authorization'] || headers['Authorization'] || '';
-  if (auth.startsWith('Bearer ')) {
-    const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
-    if (match) return match[0];
-  }
-  // Fall back to x-api-key header (Anthropic SDK style)
-  const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
-  if (xKey) {
-    const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
-    if (match) return match[0];
-  }
-  return null;
-}
-
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
@@ -990,6 +1603,98 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   return response;
 }
 
+/**
+ * 带 Key 池 failover 的转发。
+ *
+ * request 模式（旧行为）：可重试失败即换下一个 Key，最多 1 + maxRetries 次。
+ * session 模式（默认）：同一会话固定用一个 Key；普通错误在本 Key 上连续重试到
+ * failThreshold 次才换 Key，额度/凭证类错误立即换 Key，会话自动重绑到新 Key。
+ */
+async function forwardToCCWithFailover(body, clientKey, req, signal, promptCacheKey, sessionBody) {
+  const settings = keyStore.settings;
+  const sessionMode = settings.mode === 'session';
+  // 会话指纹要用「客户端原始请求体」推导：body 已是 CC 上游格式（字段在 params 下）
+  const sessionId = sessionMode ? deriveSessionId(req, sessionBody || body, clientKey) : null;
+  const maxKeys = Math.max(1, 1 + Math.max(0, keyStore.lb.maxRetries || 0));
+  const perKeyAttempts = sessionMode ? Math.max(1, settings.failThreshold || 3) : 1;
+  const budget = Math.max(1, Math.min(20, maxKeys * perKeyAttempts));
+
+  const abandoned = new Set();   // 本轮已放弃的 Key
+  let pick = null;
+  let keysUsed = 0;
+  let lastMapped = null;
+  let lastPick = null;
+
+  for (let attempt = 0; attempt < budget; attempt++) {
+    if (!pick) {
+      pick = sessionMode
+        ? pickSessionKey(sessionId, clientKey, req, body, abandoned)
+        : pickUpstreamKey(clientKey, req, abandoned);
+      if (!pick && settings.onAllExhausted === 'best-effort') pick = pickBestEffort(abandoned);
+      if (!pick) return { error: poolUnavailableResponse(), pick: null };
+      keysUsed++;
+    }
+    lastPick = pick;
+
+    let failure = null; // { mapped, retryable, trigger }
+    try {
+      await ensureInitialized(pick.apiKey, signal);
+      const response = await forwardToCC(body, pick.apiKey, req.headers, signal, promptCacheKey);
+
+      if (response.ok) {
+        markKeySuccess(pick);
+        recordSessionSuccess(sessionId);
+        return { response, pick };
+      }
+
+      const errorText = await response.text().catch(() => '');
+      log('error', 'CC API error', {
+        status: response.status,
+        body: summarizeUpstreamError(errorText),
+        keyId: pick.id,
+        attempt: attempt + 1,
+      });
+      const trigger = classifyFailure(response.status, errorText);
+      const retryable = isRetryableCcFailure(response.status, errorText);
+      markKeyFailure(pick, response.status, retryable, trigger, errorText);
+      if (retryable) recordSessionFailure(sessionId, trigger);
+      failure = { mapped: mapCcError(response.status, errorText), retryable, trigger };
+    } catch (e) {
+      if (signal?.aborted) throw e;
+      log('error', 'CC forward failed', { message: e.message, keyId: pick.id, attempt: attempt + 1 });
+      markKeyFailure(pick, 0, true, 'any-error');
+      recordSessionFailure(sessionId, 'any-error');
+      failure = { mapped: mapCcError(502, e.message), retryable: true, trigger: 'any-error' };
+    }
+
+    lastMapped = failure.mapped;
+    if (!failure.retryable || attempt >= budget - 1) return { error: lastMapped, pick };
+
+    // ── 决定：继续用同一个 Key 重试，还是换 Key ──
+    // 额度/限流、凭证失效、403（可能换了 Key 就能用）都立即换 Key；
+    // 其余错误先在本 Key 上重试，连续失败到阈值再换。
+    const immediate = failure.trigger === 'quota-exhausted'
+      || failure.trigger === 'disabled'
+      || failure.trigger === 'forbidden';
+    let transfer = true;
+    if (sessionMode && !immediate) {
+      const rec = sessionId ? sessionRoutes.get(sessionId) : null;
+      const sessionFails = rec?.failures || 0;
+      const keyFails = findKey(pick.id)?.consecutiveFailures || 0;
+      const threshold = Math.max(1, settings.failThreshold || 3);
+      transfer = sessionFails >= threshold || keyFails >= threshold;
+    }
+
+    if (!transfer) continue;              // 同一 Key 再试一次
+    if (keysUsed >= maxKeys) return { error: lastMapped, pick };
+    abandoned.add(pick.id);
+    pick = null;
+    if (sessionId) sessionRoutes.delete(sessionId); // 让下次选取重绑到新 Key
+  }
+
+  return { error: lastMapped || mapCcError(502, 'All upstream keys failed'), pick: lastPick };
+}
+
 // ── 路由 ────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
@@ -1005,9 +1710,10 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
-    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
+  const clientKey = extractClientApiKey(req.headers);
+  if (!hasAnyUsableKey() && keyStore.settings.onAllExhausted !== 'best-effort') {
+    const unavailable = poolUnavailableResponse();
+    sendJSON(res, unavailable.status, unavailable.body);
     return;
   }
 
@@ -1029,18 +1735,13 @@ async function handleChatCompletions(req, res) {
   let translator = null;
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
-
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
-      const mapped = mapCcError(ccResponse.status, errorText);
-      sendJSON(res, mapped.status, mapped.body);
+    // Key 池选取 + 可重试失败自动换 key（fingerprint/lifecycle 在 failover 内完成）
+    const fwd = await forwardToCCWithFailover(ccBody, clientKey, req, abortController.signal, openaiReq.prompt_cache_key, openaiReq);
+    if (fwd.error) {
+      sendJSON(res, fwd.error.status, fwd.error.body);
       return;
     }
+    const ccResponse = fwd.response;
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -1814,9 +2515,16 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
-    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
+  const clientKey = extractClientApiKey(req.headers);
+  if (!hasAnyUsableKey() && keyStore.settings.onAllExhausted !== 'best-effort') {
+    const unavailable = poolUnavailableResponse();
+    sendJSON(res, unavailable.status, {
+      type: 'error',
+      error: {
+        type: unavailable.status === 401 ? 'authentication_error' : 'rate_limit_error',
+        message: unavailable.body.error.message,
+      },
+    });
     return;
   }
 
@@ -1836,17 +2544,13 @@ async function handleMessages(req, res) {
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
-
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
-      const mapped = mapCcError(ccResponse.status, errorText);
+    const fwd = await forwardToCCWithFailover(ccBody, clientKey, req, abortController.signal, undefined, anthropicReq);
+    if (fwd.error) {
+      const mapped = fwd.error;
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
+    const ccResponse = fwd.response;
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -2576,10 +3280,12 @@ async function handleResponses(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
-    sendResponsesError(res, 401, 'authentication_error',
-      'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
+  const clientKey = extractClientApiKey(req.headers);
+  if (!hasAnyUsableKey() && keyStore.settings.onAllExhausted !== 'best-effort') {
+    const unavailable = poolUnavailableResponse();
+    sendResponsesError(res, unavailable.status,
+      unavailable.status === 401 ? 'authentication_error' : 'rate_limit_error',
+      unavailable.body.error.message);
     return;
   }
 
@@ -2625,16 +3331,13 @@ async function handleResponses(req, res) {
   });
 
   try {
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
-
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', body: summarizeUpstreamError(errorText) });
-      const mapped = mapCcError(ccResponse.status, errorText);
+    const fwd = await forwardToCCWithFailover(ccBody, clientKey, req, abortController.signal, promptCacheKey, chatReq);
+    if (fwd.error) {
+      const mapped = fwd.error;
       sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
     }
+    const ccResponse = fwd.response;
 
     if (stream) {
       translator = createResponsesSseTranslator(model, responseId, created);
@@ -2853,6 +3556,397 @@ function handleHealth(req, res) {
   res.end('OK');
 }
 
+// ── 管理面板 / Key 池 API ───────────────────────────
+// GET  /  /admin              → index.html
+// GET  /admin.css /admin.js   → 静态资源
+// GET/POST /admin/api/keys    → 列出 / 新增
+// PATCH/DELETE /admin/api/keys/:id
+// GET  /admin/api/keys/:id/credits
+// POST /admin/api/keys/refresh-credits
+// GET/PUT /admin/api/lb       → 负载均衡配置
+
+const UI_FILES = {
+  '/': { path: resolve(__dirname, 'index.html'), type: 'text/html; charset=utf-8' },
+  '/index.html': { path: resolve(__dirname, 'index.html'), type: 'text/html; charset=utf-8' },
+  '/admin': { path: resolve(__dirname, 'index.html'), type: 'text/html; charset=utf-8' },
+  '/admin/': { path: resolve(__dirname, 'index.html'), type: 'text/html; charset=utf-8' },
+  '/admin.css': { path: resolve(__dirname, 'admin.css'), type: 'text/css; charset=utf-8' },
+  '/admin.js': { path: resolve(__dirname, 'admin.js'), type: 'application/javascript; charset=utf-8' },
+};
+
+function publicKeyView(k) {
+  const cooling = k.cooldownUntil && k.cooldownUntil > Date.now();
+  return {
+    id: k.id,
+    label: k.label,
+    keyPrefix: k.key.slice(0, 12) + '…',
+    weight: k.weight,
+    enabled: k.enabled,
+    priority: k.priority,
+    createdAt: k.createdAt,
+    lastUsedAt: k.lastUsedAt,
+    lastErrorAt: k.lastErrorAt,
+    errorCount: k.errorCount,
+    consecutiveFailures: k.consecutiveFailures || 0,
+    autoDisabled: k.autoDisabled || null,
+    cooldownUntil: cooling ? k.cooldownUntil : 0,
+    cooling,
+    isDefault: k.id === keyStore.defaultId,
+    credits: k.credits,
+    activeSessions: activeSessionCounts().get(k.id) || 0,
+  };
+}
+
+/** 服务端轮询状态（前端用来显示上次/下次刷新与倒计时） */
+function creditsRefreshState() {
+  return {
+    intervalMs: keyStore.settings.creditsRefreshMs,
+    running: creditsRefresh.running,
+    lastAt: creditsRefresh.lastAt,
+    nextAt: creditsRefresh.nextAt,
+    lastDurationMs: creditsRefresh.lastDurationMs,
+    lastOk: creditsRefresh.lastOk,
+    lastFailed: creditsRefresh.lastFailed,
+    lastError: creditsRefresh.lastError,
+  };
+}
+
+/** 当前会话 → Key 绑定（只暴露不可逆的短标识） */
+function sessionRoutesView() {
+  const now = Date.now();
+  const ttl = keyStore.settings.sessionTtlMs;
+  const out = [];
+  for (const [sid, rec] of sessionRoutes) {
+    if (now - rec.lastAt > ttl) continue;
+    const k = findKey(rec.keyId);
+    out.push({
+      id: sid,
+      tag: sessTag(sid),
+      shortId: sid.slice(0, 18),
+      kind: sid.slice(0, 2).replace('_', ''),
+      keyId: rec.keyId,
+      keyLabel: k ? k.label : '(已删除)',
+      boundAt: rec.boundAt,
+      lastAt: rec.lastAt,
+      failures: rec.failures || 0,
+      idleMs: now - rec.lastAt,
+    });
+  }
+  return out.sort((a, b) => b.lastAt - a.lastAt).slice(0, 200);
+}
+
+async function ccGet(path, key, orgId) {
+  const url = new URL(CFG.apiBase + path);
+  if (orgId) url.searchParams.set('orgId', orgId);
+  const r = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${key}`,
+      'Accept': 'application/json',
+      'x-cli-environment': 'production',
+      'x-command-code-version': CC_VERSION,
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!r.ok) throw new Error(`${path} HTTP ${r.status}`);
+  return r.json();
+}
+
+// credits.{monthlyCredits,purchasedCredits,freeCredits} + windowLimits.{fiveHour,weekly}
+async function fetchCreditsForKey(k) {
+  const fetchedAt = Date.now();
+  let orgId = null;
+  try { orgId = (await ccGet('/alpha/whoami', k.key)).org?.id || null; } catch {}
+
+  let root;
+  try { root = await ccGet('/alpha/billing/credits', k.key, orgId); }
+  catch (e) { return { error: e.message, fetchedAt }; }
+  if (root?.error) return { error: String(root.error), fetchedAt };
+
+  let plan = null;
+  try { plan = (await ccGet('/alpha/billing/subscriptions', k.key, orgId)).data?.planId || null; } catch {}
+
+  const ledger = root.credits || {};
+  const num = (v) => Number(v) || 0;
+  const credits = {
+    monthly: num(ledger.monthlyCredits),
+    purchased: num(ledger.purchasedCredits),
+    free: num(ledger.freeCredits),
+  };
+  credits.remaining = credits.monthly + credits.purchased + credits.free;
+
+  const wl = root.windowLimits || ledger.windowLimits || {};
+  const windows = [['5h', wl.fiveHour], ['weekly', wl.weekly]]
+    .filter(([, w]) => w && isFinite(Number(w.used)) && isFinite(Number(w.cap)))
+    .map(([name, w]) => {
+      const used = Number(w.used), cap = Number(w.cap);
+      const resetAt = typeof w.resetAt === 'number' ? w.resetAt : Date.parse(w.resetAt);
+      return {
+        name, used, cap,
+        resetsAt: isFinite(resetAt) ? resetAt : null,
+        pct: cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0,
+      };
+    });
+
+  return {
+    fetchedAt, plan, credits,
+    creditsRemaining: credits.remaining,
+    windows,
+    worstPct: windows.reduce((m, w) => Math.max(m, w.pct), 0),
+  };
+}
+
+// ── 额度轮询（服务端定时刷新） ───────────────────────
+// 中转站要靠额度数据判断某个 Key 还能不能用，所以轮询必须跑在服务端，
+// 间隔由管理页配置并持久化到 keys.json。
+const creditsRefresh = {
+  running: false,
+  lastAt: 0,
+  nextAt: 0,
+  lastDurationMs: 0,
+  lastOk: 0,
+  lastFailed: 0,
+  lastError: null,
+};
+let creditsRefreshTimer = null;
+
+async function refreshAllCredits() {
+  if (creditsRefresh.running) return creditsRefresh;
+  creditsRefresh.running = true;
+  const t0 = Date.now();
+  let ok = 0;
+  let failed = 0;
+  try {
+    expireAutoDisables();
+    // 并发刷新，避免 Key 多时一轮跑太久（每个 Key 要打 3 个上游接口）
+    const list = [...keyStore.keys];
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < list.length) {
+        const k = list[cursor++];
+        try {
+          k.credits = await fetchCreditsForKey(k);
+          if (k.credits?.error) failed++; else ok++;
+        } catch (e) {
+          failed++;
+          log('warn', 'Credits refresh failed', { keyId: k.id, message: e.message });
+        }
+        syncAutoDisable(k);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, list.length) }, worker));
+    saveKeyStore();
+    creditsRefresh.lastOk = ok;
+    creditsRefresh.lastFailed = failed;
+    creditsRefresh.lastError = failed ? `${failed} 个 Key 查询失败` : null;
+    creditsRefresh.lastAt = Date.now();
+    creditsRefresh.lastDurationMs = creditsRefresh.lastAt - t0;
+    log('info', 'Credits refreshed', { ok, failed, durationMs: creditsRefresh.lastDurationMs });
+  } finally {
+    creditsRefresh.running = false;
+  }
+  return creditsRefresh;
+}
+
+/** 按当前设置重排轮询定时器（自调度，避免刷新未结束时叠加） */
+function scheduleCreditsRefresh() {
+  if (creditsRefreshTimer) {
+    clearTimeout(creditsRefreshTimer);
+    creditsRefreshTimer = null;
+  }
+  const ms = Math.max(0, Number(keyStore.settings.creditsRefreshMs) || 0);
+  if (!ms) {
+    creditsRefresh.nextAt = 0;
+    log('info', 'Credits auto-refresh disabled');
+    return;
+  }
+  creditsRefreshTimer = setTimeout(async () => {
+    try {
+      await refreshAllCredits();
+    } catch (e) {
+      log('warn', 'Credits refresh loop error', { message: e.message });
+    }
+    scheduleCreditsRefresh();
+  }, ms);
+  if (creditsRefreshTimer.unref) creditsRefreshTimer.unref();
+  creditsRefresh.nextAt = Date.now() + ms;
+  log('info', 'Credits auto-refresh scheduled', { intervalMs: ms });
+}
+
+async function readJsonOr400(req, res) {
+  try {
+    return await readBody(req);
+  } catch (e) {
+    sendJSON(res, e.statusCode === 413 ? 413 : 400, { error: { message: e.message, type: 'invalid_request_error' } });
+    return null;
+  }
+}
+
+function serveUiFile(req, res, pathname) {
+  const f = UI_FILES[pathname];
+  if (!f || !existsSync(f.path)) {
+    sendJSON(res, 404, { error: { message: 'UI file not found: ' + pathname, type: 'not_found' } });
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': f.type, 'Cache-Control': 'no-store' });
+  res.end(readFileSync(f.path));
+}
+
+const LB_FIELDS = ['strategy', 'stickyBy', 'maxRetries', 'cooldownMs'];
+
+function currentLbConfig() {
+  return {
+    strategy: keyStore.lb.strategy,
+    stickyBy: keyStore.lb.stickyBy,
+    maxRetries: keyStore.lb.maxRetries,
+    cooldownMs: keyStore.lb.cooldownMs,
+  };
+}
+
+async function handleAdminApi(req, res, url) {
+  const path = url.pathname.replace(/^\/admin\/api/, '') || '/';
+
+  if (path === '/lb') {
+    if (req.method === 'GET') return sendJSON(res, 200, currentLbConfig());
+    if (req.method === 'PUT') {
+      const body = await readJsonOr400(req, res);
+      if (!body) return;
+      for (const f of LB_FIELDS) {
+        if (body[f] === undefined) continue;
+        if (f === 'strategy' || f === 'stickyBy') keyStore.lb[f] = String(body[f]);
+        else keyStore.lb[f] = Number(body[f]) || 0;
+      }
+      const strategies = ['round-robin', 'weighted', 'random', 'weighted-random', 'sticky', 'least-recent', 'failover'];
+      const stickies = ['none', 'ip', 'client-key'];
+      if (!strategies.includes(keyStore.lb.strategy)) keyStore.lb.strategy = 'weighted';
+      if (!stickies.includes(keyStore.lb.stickyBy)) keyStore.lb.stickyBy = 'client-key';
+      keyStore.lb.maxRetries = Math.max(0, Math.min(5, keyStore.lb.maxRetries | 0));
+      keyStore.lb.cooldownMs = Math.max(0, Math.min(3600000, keyStore.lb.cooldownMs | 0));
+      saveKeyStore();
+      return sendJSON(res, 200, currentLbConfig());
+    }
+  }
+
+  if (path === '/settings') {
+    if (req.method === 'GET') {
+      return sendJSON(res, 200, { settings: keyStore.settings, creditsRefresh: creditsRefreshState() });
+    }
+    if (req.method === 'PUT') {
+      const body = await readJsonOr400(req, res);
+      if (!body) return;
+      const before = keyStore.settings.creditsRefreshMs;
+      keyStore.settings = normalizeSettings({ ...keyStore.settings, ...body });
+      saveKeyStore();
+      if (keyStore.settings.creditsRefreshMs !== before) scheduleCreditsRefresh();
+      // 设置变化后立刻重算自动停用状态（例如刚打开/关闭"额度用尽自动停用"）
+      for (const k of keyStore.keys) syncAutoDisable(k);
+      saveKeyStore();
+      return sendJSON(res, 200, { settings: keyStore.settings, creditsRefresh: creditsRefreshState() });
+    }
+  }
+
+  if (path === '/sessions') {
+    if (req.method === 'GET') return sendJSON(res, 200, { sessions: sessionRoutesView() });
+    if (req.method === 'DELETE') {
+      const count = sessionRoutes.size;
+      sessionRoutes.clear();
+      log('info', 'Session bindings cleared from admin', { count });
+      return sendJSON(res, 200, { cleared: count, sessions: [] });
+    }
+  }
+
+  if (path === '/keys/refresh-credits' && req.method === 'POST') {
+    await refreshAllCredits();
+    return sendJSON(res, 200, {
+      results: keyStore.keys.map((k) => ({ id: k.id, credits: k.credits })),
+      creditsRefresh: creditsRefreshState(),
+    });
+  }
+
+  if (path === '/keys') {
+    if (req.method === 'GET') {
+      // 顺手清理已到恢复时间的自动停用，保证界面状态与调度一致
+      if (expireAutoDisables()) saveKeyStore();
+      return sendJSON(res, 200, {
+        apiBase: CFG.apiBase,
+        lb: currentLbConfig(),
+        settings: keyStore.settings,
+        creditsRefresh: creditsRefreshState(),
+        serverTime: Date.now(),
+        defaultId: keyStore.defaultId,
+        sessions: sessionRoutesView(),
+        keys: keyStore.keys.map(publicKeyView),
+      });
+    }
+    if (req.method === 'POST') {
+      const body = await readJsonOr400(req, res);
+      if (!body) return;
+      const key = String(body.key || '').trim();
+      const label = String(body.label || '').trim();
+      if (!/^user_[a-zA-Z0-9_-]+$/.test(key)) {
+        return sendJSON(res, 400, { error: { message: 'key must match /^user_[a-zA-Z0-9_-]+$/', type: 'invalid_request_error' } });
+      }
+      if (keyStore.keys.some((k) => k.key === key)) {
+        return sendJSON(res, 409, { error: { message: 'key already exists', type: 'conflict' } });
+      }
+      const entry = {
+        id: newKeyId(),
+        label: label || '未命名',
+        key,
+        weight: Number.isFinite(+body.weight) ? Math.max(0, +body.weight) : 1,
+        enabled: body.enabled !== false,
+        priority: Number.isFinite(+body.priority) ? +body.priority : 0,
+        createdAt: Date.now(),
+        lastUsedAt: null,
+        lastErrorAt: null,
+        errorCount: 0,
+        cooldownUntil: 0,
+        credits: null,
+      };
+      keyStore.keys.push(entry);
+      saveKeyStore();
+      return sendJSON(res, 201, { ...publicKeyView(entry), key: entry.key });
+    }
+  }
+
+  const m = path.match(/^\/keys\/([A-Za-z0-9_]+)(\/credits)?$/);
+  const entry = m ? findKey(m[1]) : null;
+  if (entry) {
+    if (m[2] && req.method === 'GET') {
+      entry.credits = await fetchCreditsForKey(entry);
+      saveKeyStore();
+      return sendJSON(res, 200, entry.credits);
+    }
+    if (req.method === 'PATCH') {
+      const body = await readJsonOr400(req, res);
+      if (!body) return;
+      if (typeof body.label === 'string' && body.label.trim()) entry.label = body.label.trim();
+      if (body.weight !== undefined) entry.weight = Math.max(0, Number(body.weight) || 0);
+      if (body.enabled !== undefined) entry.enabled = !!body.enabled;
+      if (body.priority !== undefined) entry.priority = Number(body.priority) || 0;
+      if (body.default === true) keyStore.defaultId = entry.id;
+      else if (body.default === false && keyStore.defaultId === entry.id) keyStore.defaultId = null;
+      saveKeyStore();
+      return sendJSON(res, 200, publicKeyView(entry));
+    }
+    if (req.method === 'DELETE') {
+      keyStore.keys = keyStore.keys.filter((k) => k.id !== entry.id);
+      wrrCurrent.delete(entry.id);
+      if (keyStore.defaultId === entry.id) keyStore.defaultId = null;
+      // 清掉指向该 Key 的会话绑定，让相关会话下次请求自动重绑
+      for (const [sid, rec] of sessionRoutes) {
+        if (rec.keyId === entry.id) sessionRoutes.delete(sid);
+      }
+      saveKeyStore();
+      res.writeHead(204);
+      return res.end();
+    }
+  }
+
+  return entry
+    ? sendJSON(res, 405, { error: { message: 'method not allowed', type: 'invalid_request_error' } })
+    : sendJSON(res, 404, { error: { message: 'admin route not found', type: 'not_found' } });
+}
+
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
@@ -2869,8 +3963,14 @@ const server = http.createServer(async (req, res) => {
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
 
-  // 在途上限准入。/health 与 / 例外：探活与编排器不该因业务繁忙而收 503。
-  const isLiveness = url.pathname === '/health' || url.pathname === '/';
+  // 在途上限准入。/health 与管理 UI 例外：探活与编排器不该因业务繁忙而收 503。
+  const isLiveness = url.pathname === '/health'
+    || url.pathname === '/'
+    || url.pathname === '/index.html'
+    || url.pathname === '/admin'
+    || url.pathname === '/admin/'
+    || url.pathname === '/admin.css'
+    || url.pathname === '/admin.js';
   if (!isLiveness && MAX_INFLIGHT > 0) {
     if (inflightCount >= MAX_INFLIGHT) {
       log('warn', 'In-flight limit reached, rejecting request', {
@@ -2896,6 +3996,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // 管理面板与 Key 池 API
+    if (url.pathname.startsWith('/admin/api/') || url.pathname === '/admin/api') {
+      await handleAdminApi(req, res, url);
+      return;
+    }
+    if (UI_FILES[url.pathname]) {
+      serveUiFile(req, res, url.pathname);
+      return;
+    }
+
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       await handleChatCompletions(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
@@ -2904,7 +4014,7 @@ const server = http.createServer(async (req, res) => {
       await handleResponses(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
-    } else if (url.pathname === '/health' || url.pathname === '/') {
+    } else if (url.pathname === '/health') {
       handleHealth(req, res);
     } else {
       sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
@@ -2924,12 +4034,24 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
+// 启动时按已持久化的额度数据同步一次自动停用状态，并开启额度轮询
+for (const k of keyStore.keys) syncAutoDisable(k);
+scheduleCreditsRefresh();
+if (keyStore.settings.creditsRefreshMs > 0) {
+  // 启动后先拉一次，让管理页与调度尽快拿到真实额度
+  setTimeout(() => { refreshAllCredits().catch(() => {}); }, 3000).unref?.();
+}
+
 server.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
     models: MODELS.length,
     session: '12h + 1h jitter, per API key',
+    routing: `${keyStore.settings.mode} mode, failThreshold=${keyStore.settings.failThreshold}, keys=${keyStore.keys.length}`,
+    creditsRefresh: keyStore.settings.creditsRefreshMs > 0
+      ? `every ${Math.round(keyStore.settings.creditsRefreshMs / 1000)}s (auto-disable exhausted: ${keyStore.settings.autoDisableExhausted ? 'on' : 'off'})`
+      : 'off',
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',

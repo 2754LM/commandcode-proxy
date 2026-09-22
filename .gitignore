@@ -7,4 +7,6 @@ AGENTS.md
 stdout.txt
 stderr.txt
 captured-requests/
-
+keys.json
+# docker compose 挂载出来的数据目录（里面有真实 Key，绝不能提交）
+data/
