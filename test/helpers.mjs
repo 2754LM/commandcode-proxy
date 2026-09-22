@@ -3,7 +3,7 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { mkdtempSync, copyFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, copyFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -104,9 +104,24 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
     copyFileSync(join(REPO, 'config.json'), join(workdir, 'config.json'));
   }
   // 本分支的 Key 来自本地 Key 池（keys.json），不再走请求头 BYOK；
-  // 测试里也带一份池子，否则每个请求都会被「池为空」挡下（401）。
-  if (!existsSync(join(workdir, 'keys.json')) && existsSync(join(REPO, 'keys.json'))) {
-    copyFileSync(join(REPO, 'keys.json'), join(workdir, 'keys.json'));
+  // 测试里也得有池子，否则每个请求都会被「池为空」挡成 401。
+  // 注意：这里**生成**一个假 Key，绝不复制仓库里真实的 keys.json —— 免得把真 Key
+  // 拷进临时目录。需要自定义池子的测试请自己传 cwd。
+  if (!existsSync(join(workdir, 'keys.json'))) {
+    writeFileSync(join(workdir, 'keys.json'), JSON.stringify({
+      lb: { strategy: 'weighted', stickyBy: 'client-key', maxRetries: 2, cooldownMs: 60000 },
+      settings: {
+        mode: 'session', failThreshold: 3, sessionTtlMs: 21600000,
+        creditsRefreshMs: 0, autoDisableExhausted: true, onAllExhausted: 'error',
+      },
+      keys: [{
+        id: 'key_testdummy', label: 'test', key: 'user_testdummy000000000001',
+        weight: 1, enabled: true, priority: 0, createdAt: 0, lastUsedAt: null,
+        lastErrorAt: null, errorCount: 0, cooldownUntil: 0, consecutiveFailures: 0,
+        autoDisabled: null, credits: null,
+      }],
+      defaultId: null,
+    }, null, 2));
   }
   const child = spawn(process.execPath, ['proxy.mjs'], {
     cwd: workdir,
